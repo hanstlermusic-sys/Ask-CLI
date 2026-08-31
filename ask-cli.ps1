@@ -12,7 +12,7 @@ $ConfigPath = Join-Path $AskHome 'config.json'
 $HistoryPath = Join-Path $AskHome 'history.jsonl'
 $ProfilesPath = Join-Path $AskHome 'project-profiles.json'
 
-$script:AskCliVersion = '0.4.1'
+$script:AskCliVersion = '0.5.0'
 $script:ResolvedCopilot = ''
 $script:Invoker = $null
 $script:Cfg = $null
@@ -98,13 +98,31 @@ function Default-Config {
     maxCredits = 0
     retry = $true
     verify = $true
+    agentMode = 'interactive' # interactive|plan|autopilot
+    effort = ''
+    assistedApproval = $false
+    maxContinues = 0
+    noAskUser = $false
+    qualityGate = $false
+    verifyCommand = ''
     guard = 'auto'   # auto|always|off
   }
+}
+
+# Escritura de propiedades tolerante al tipo del envelope (hashtable o PSCustomObject).
+function Set-Prop($obj, [string]$name, $value) {
+  if ($null -eq $obj) { return }
+  if ($obj -is [System.Collections.IDictionary]) { $obj[$name] = $value; return }
+  $obj | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
 }
 
 # Acceso a propiedades de JSON tolerante a Set-StrictMode.
 function Get-Prop($obj, [string]$name) {
   if ($null -eq $obj) { return $null }
+  if ($obj -is [System.Collections.IDictionary]) {
+    if ($obj.Contains($name)) { return $obj[$name] }
+    return $null
+  }
   if (-not $obj.PSObject) { return $null }
   $p = $obj.PSObject.Properties[$name]
   if ($null -eq $p) { return $null }
@@ -242,6 +260,20 @@ function Resolve-Settings($cfg, [hashtable]$opts) {
   $out.maxCredits = if ((ConvertTo-IntValue $opts.maxCredits 0) -gt 0) { ConvertTo-IntValue $opts.maxCredits 0 } else { ConvertTo-IntValue $cfg.maxCredits 0 }
   $out.guard = if ($prof -and $prof.guard) { [string]$prof.guard } else { [string]$cfg.guard }
   if (-not $out.guard) { $out.guard = 'auto' }
+
+  $out.agentMode = if ($opts.agentMode) { [string]$opts.agentMode } elseif ($prof -and (Get-Prop $prof 'agentMode')) { [string](Get-Prop $prof 'agentMode') } else { [string](Get-Prop $cfg 'agentMode') }
+  if (-not $out.agentMode) { $out.agentMode = 'interactive' }
+  if ($script:ValidAgentMode -notcontains $out.agentMode) { throw "agentMode invalido: '$($out.agentMode)'. Validos: $($script:ValidAgentMode -join ', ')" }
+
+  $out.effort = if ($opts.effort) { [string]$opts.effort } elseif ($prof -and (Get-Prop $prof 'effort')) { [string](Get-Prop $prof 'effort') } else { [string](Get-Prop $cfg 'effort') }
+  if ($out.effort -and $script:ValidEffort -notcontains $out.effort) { throw "effort invalido: '$($out.effort)'. Validos: $($script:ValidEffort -join ', ')" }
+
+  $out.assistedApproval = if ($null -ne $opts.assistedApproval) { ConvertTo-BoolValue $opts.assistedApproval $false } else { ConvertTo-BoolValue (Get-Prop $cfg 'assistedApproval') $false }
+  $out.noAskUser = if ($null -ne $opts.noAskUser) { ConvertTo-BoolValue $opts.noAskUser $false } else { ConvertTo-BoolValue (Get-Prop $cfg 'noAskUser') $false }
+  $out.maxContinues = if ((ConvertTo-IntValue $opts.maxContinues 0) -gt 0) { ConvertTo-IntValue $opts.maxContinues 0 } else { ConvertTo-IntValue (Get-Prop $cfg 'maxContinues') 0 }
+  $out.qualityGate = if ($null -ne $opts.qualityGate) { ConvertTo-BoolValue $opts.qualityGate $false } else { ConvertTo-BoolValue (Get-Prop $cfg 'qualityGate') $false }
+  $out.verifyCommand = if ($opts.verifyCommand) { [string]$opts.verifyCommand } elseif ($prof -and (Get-Prop $prof 'verifyCommand')) { [string](Get-Prop $prof 'verifyCommand') } else { [string](Get-Prop $cfg 'verifyCommand') }
+
   return $out
 }
 
@@ -515,6 +547,93 @@ function Build-PermissionArgs([hashtable]$settings) {
   return $a
 }
 
+# Flags que gobiernan la autonomia del agente. Nota: --assisted-approval se ignora
+# en silencio sin --experimental, asi que los emitimos siempre juntos.
+function Build-AgentArgs([hashtable]$settings) {
+  $a = @()
+  $agentMode = [string]$settings.agentMode
+  if ($agentMode -and $agentMode -ne 'interactive') { $a += @('--mode', $agentMode) }
+  if ($agentMode -eq 'autopilot') {
+    $mc = ConvertTo-IntValue $settings.maxContinues 0
+    if ($mc -gt 0) { $a += @('--max-autopilot-continues', [string]$mc) }
+  }
+  $effort = [string]$settings.effort
+  if ($effort) { $a += @('--effort', $effort) }
+  if (ConvertTo-BoolValue $settings.assistedApproval $false) {
+    $a += @('--experimental', '--assisted-approval')
+  }
+  if (ConvertTo-BoolValue $settings.noAskUser $false) { $a += '--no-ask-user' }
+  return $a
+}
+
+$script:ValidEffort = @('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
+$script:ValidAgentMode = @('interactive', 'plan', 'autopilot')
+
+# Comandos de verificacion por stack. El orden importa: se elige el primer marcador
+# que exista, de mas especifico a mas generico.
+$script:QualityProbes = @(
+  @{ name = 'pester';  marker = { param($d) @(Get-ChildItem $d -Recurse -Filter '*.Tests.ps1' -File -ErrorAction SilentlyContinue | Select-Object -First 1).Count -gt 0 }
+     cmd = 'Invoke-Pester -Path . -Output None -CI' }
+  @{ name = 'node';    marker = { param($d) Test-Path (Join-Path $d 'package.json') }
+     cmd = 'npm test --silent' }
+  @{ name = 'python';  marker = { param($d) (Test-Path (Join-Path $d 'pytest.ini')) -or (Test-Path (Join-Path $d 'pyproject.toml')) -or (Test-Path (Join-Path $d 'setup.cfg')) -or (Test-Path (Join-Path $d 'tests')) -or @(Get-ChildItem $d -Filter 'test_*.py' -File -ErrorAction SilentlyContinue | Select-Object -First 1).Count -gt 0 }
+     cmd = 'python -m pytest -q' }
+  @{ name = 'dotnet';  marker = { param($d) @(Get-ChildItem $d -Recurse -Include '*.sln', '*.csproj' -File -ErrorAction SilentlyContinue | Select-Object -First 1).Count -gt 0 }
+     cmd = 'dotnet test --nologo -v q' }
+  @{ name = 'go';      marker = { param($d) Test-Path (Join-Path $d 'go.mod') }
+     cmd = 'go test ./...' }
+  @{ name = 'rust';    marker = { param($d) Test-Path (Join-Path $d 'Cargo.toml') }
+     cmd = 'cargo test --quiet' }
+)
+
+function Get-QualityCommand([string]$dir, [string]$override) {
+  if ($override) { return @{ name = 'custom'; cmd = $override } }
+  $d = if ($dir) { $dir } else { (Get-Location).Path }
+  if (-not (Test-Path $d)) { return $null }
+  foreach ($probe in $script:QualityProbes) {
+    try { if (& $probe.marker $d) { return @{ name = $probe.name; cmd = $probe.cmd } } } catch {}
+  }
+  return $null
+}
+
+# Ejecuta la suite real del proyecto. "El modelo dijo que pasan" no es evidencia:
+# esto la produce.
+function Invoke-QualityGate([string]$dir, [string]$command, [int]$timeoutSec) {
+  $d = if ($dir) { $dir } else { (Get-Location).Path }
+  $out = New-Object System.Text.StringBuilder
+  $exit = 0
+  $prev = Get-Location
+  try {
+    Set-Location $d
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $lines = @(Invoke-Expression "$command 2>&1" | ForEach-Object { [string]$_ })
+    $exit = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+    $sw.Stop()
+    # Solo interesa la cola: es donde viven los fallos y los resumenes.
+    $tail = if ($lines.Count -gt 40) { $lines[-40..-1] } else { $lines }
+    foreach ($l in $tail) { [void]$out.AppendLine($l) }
+    return @{ ok = ($exit -eq 0); exitCode = $exit; output = $out.ToString().Trim(); ms = $sw.ElapsedMilliseconds; command = $command }
+  } catch {
+    return @{ ok = $false; exitCode = 1; output = ('No se pudo ejecutar la verificacion: ' + $_.Exception.Message); ms = 0; command = $command }
+  } finally { Set-Location $prev }
+}
+
+function Build-QualityFeedback([hashtable]$gate) {
+  $sb = New-Object System.Text.StringBuilder
+  [void]$sb.AppendLine('LA VERIFICACION DEL PROYECTO HA FALLADO.')
+  [void]$sb.AppendLine(('Comando ejecutado: ' + $gate.command))
+  [void]$sb.AppendLine(('Codigo de salida: ' + $gate.exitCode))
+  [void]$sb.AppendLine('')
+  [void]$sb.AppendLine('Salida real:')
+  [void]$sb.AppendLine('---')
+  [void]$sb.AppendLine($gate.output)
+  [void]$sb.AppendLine('---')
+  [void]$sb.AppendLine('')
+  [void]$sb.AppendLine('Corrige la causa raiz y vuelve a ejecutar la suite hasta que pase.')
+  [void]$sb.Append('No modifiques ni desactives los tests para forzar un verde: arregla el codigo.')
+  return $sb.ToString()
+}
+
 function ConvertTo-ToolList($value) {
   if ($null -eq $value) { return '' }
   $items = @()
@@ -540,6 +659,7 @@ function Invoke-CopilotPrompt([string]$prompt, [hashtable]$settings, [hashtable]
   foreach ($a in $opts.attachments) { $cargs += @('--attachment', [string]$a) }
   foreach ($d in $opts.addDirs) { $cargs += @('--add-dir', [string]$d) }
   $cargs += Build-PermissionArgs $settings
+  $cargs += Build-AgentArgs $settings
   $maxCredits = ConvertTo-IntValue $settings.maxCredits 0
   if ($maxCredits -gt 0) { $cargs += @('--max-ai-credits', [string]$maxCredits) }
 
@@ -785,6 +905,7 @@ function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opt
     $res.usage = @{ premiumRequests = 0; apiMs = 0; sessionMs = 0; linesAdded = 0; linesRemoved = 0 }
     $res.verified = $true
     $res.issues = @()
+    Set-Prop $res 'quality' $null
     return $res
   }
 
@@ -794,6 +915,20 @@ function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opt
   $resumeId = [string]$opts.resume
 
   $res = Invoke-CopilotPrompt $effective $settings $opts $sessionId $resumeId
+
+  # Algunos modelos (entre ellos el default "auto") rechazan --effort y abortan
+  # la corrida entera. Degradamos en vez de fallar: el trabajo importa mas que el flag.
+  if ($res.code -ne 0 -and $settings.effort -and
+      ([string]$res['raw'] -match 'does not support reasoning effort')) {
+    if (-not $opts.quiet) {
+      Write-Notice ("[ask-cli] el modelo '" + $settings.model + "' no admite --effort " + $settings.effort + "; reintentando sin ese flag") $settings
+    }
+    $degraded = @{}
+    foreach ($k in $settings.Keys) { $degraded[$k] = $settings[$k] }
+    $degraded.effort = ''
+    $settings = $degraded
+    $res = Invoke-CopilotPrompt $effective $settings $opts ([Guid]::NewGuid().ToString()) $resumeId
+  }
 
   $wantVerify = (ConvertTo-BoolValue $opts.verify $true) -and (ConvertTo-BoolValue $cfg.verify $true)
   $wantRetry = (ConvertTo-BoolValue $opts.retry $true) -and (ConvertTo-BoolValue $cfg.retry $true)
@@ -821,6 +956,40 @@ function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opt
 
   $res.verified = [bool]$verification.ok
   $res.issues = @($verification.issues)
+
+  # Gate de calidad: solo tiene sentido si realmente se toco codigo.
+  Set-Prop $res 'quality' $null
+  $touched = (@($res.filesModified).Count -gt 0) -or (Test-HasWriteTool $res.toolCalls)
+  $wantQuality = (ConvertTo-BoolValue (Get-Prop $opts 'quality') $true) -and (ConvertTo-BoolValue (Get-Prop $settings 'qualityGate') $false)
+  if ($wantQuality -and $res.code -eq 0 -and $touched) {
+    $qc = Get-QualityCommand (Get-Prop $settings 'dir') ([string](Get-Prop $settings 'verifyCommand'))
+    if ($null -eq $qc) {
+      if (-not $opts.quiet) { Write-Notice '[ask-cli] gate de calidad: no se detecto suite de tests, se omite' $settings 'DarkGray' }
+    } else {
+      if (-not $opts.quiet) { Write-Notice ("[ask-cli] gate de calidad (" + $qc.name + "): " + $qc.cmd) $settings 'DarkCyan' }
+      $gate = Invoke-QualityGate $settings.dir $qc.cmd $settings.timeoutSec
+
+      if (-not $gate.ok -and $wantRetry -and $res.resume) {
+        if (-not $opts.quiet) { Write-Notice '[ask-cli] la suite falla, devolviendo el error al agente...' $settings }
+        $fix = Invoke-CopilotPrompt (Build-QualityFeedback $gate) $settings $opts '' $res.resume
+        if ($fix.code -eq 0) {
+          foreach ($t in $res.toolCalls) { $fix.toolCalls.Add($t) }
+          if (@($fix.filesModified).Count -eq 0) { $fix.filesModified = $res.filesModified }
+          $fix.verified = $true
+          $fix.issues = @()
+          $res = $fix
+          $gate = Invoke-QualityGate $settings.dir $qc.cmd $settings.timeoutSec
+        }
+      }
+
+      Set-Prop $res 'quality' $gate
+      if (-not $gate.ok) {
+        $res.verified = $false
+        $res.issues = @($res.issues) + ("La suite del proyecto falla (" + $qc.cmd + ", exit " + $gate.exitCode + ").")
+      }
+    }
+  }
+
   if ($res.resume) { $cfg.lastResume = $res.resume }
   return $res
 }
@@ -865,7 +1034,24 @@ Opciones:
   --no-stream                 Desactiva streaming incremental.
   --no-retry                  No reintenta ante verificacion fallida.
   --no-verify                 Desactiva la verificacion determinista de ejecucion.
-  --safe | --trusted          Atajos de modo.
+  --safe | --trusted          Atajos de modo de permisos.
+
+Autonomia del agente:
+  --dev                       Modo dev autonomo: autopilot + trusted + effort high
+                              + gate de calidad. Es el atajo recomendado.
+  --autopilot                 El agente ejecuta el ciclo completo sin intervencion.
+  --plan                      Solo planifica, no ejecuta cambios.
+  --agent-mode <m>            interactive|plan|autopilot.
+  --effort <nivel>            none|minimal|low|medium|high|xhigh|max.
+  --max-continues <n>         Iteraciones maximas de autopilot (default Copilot: 5).
+  --assisted-approval         Juez de aprobacion de Copilot (experimental; NO es
+                              una barrera de seguridad fiable, ver README).
+  --no-ask-user               Prohibe al agente hacer preguntas (falla en vez de preguntar).
+
+Gate de calidad:
+  --quality                   Ejecuta la suite real del proyecto tras tocar codigo.
+  --verify-cmd <cmd>          Comando de verificacion explicito (implica --quality).
+  --no-quality                Desactiva el gate aunque este activo en config.
   --force-profile-override    Ignora un perfil estricto.
   --                          Todo lo que siga es prompt literal.
 
@@ -913,6 +1099,15 @@ function Parse-Options([string[]]$tokens) {
     verbose = $false
     retry = $true
     verify = $true
+    quality = $true
+    agentMode = ''
+    effort = ''
+    assistedApproval = $null
+    maxContinues = 0
+    noAskUser = $null
+    qualityGate = $null
+    verifyCommand = ''
+    dev = $false
     forceProfileOverride = $false
     strictProfile = ''
     prompt = @()
@@ -932,6 +1127,25 @@ function Parse-Options([string[]]$tokens) {
       '--allow-tool' { $i++; if ($i -lt $tokens.Count) { $opts.allowTools = [string]$tokens[$i] } }
       '--deny-tool' { $i++; if ($i -lt $tokens.Count) { $opts.denyTools = ConvertTo-ToolList @($opts.denyTools, $tokens[$i]) } }
       '--agent'    { $i++; if ($i -lt $tokens.Count) { $opts.agent = [string]$tokens[$i] } }
+      '--agent-mode' { $i++; if ($i -lt $tokens.Count) { $opts.agentMode = [string]$tokens[$i] } }
+      '--autopilot' { $opts.agentMode = 'autopilot' }
+      '--plan'      { $opts.agentMode = 'plan' }
+      '--effort'    { $i++; if ($i -lt $tokens.Count) { $opts.effort = [string]$tokens[$i] } }
+      '--assisted-approval' { $opts.assistedApproval = $true }
+      '--max-continues' { $i++; if ($i -lt $tokens.Count) { $opts.maxContinues = ConvertTo-IntValue $tokens[$i] 0 } }
+      '--no-ask-user' { $opts.noAskUser = $true }
+      '--quality'   { $opts.qualityGate = $true }
+      '--no-quality' { $opts.quality = $false }
+      '--verify-cmd' { $i++; if ($i -lt $tokens.Count) { $opts.verifyCommand = [string]$tokens[$i]; $opts.qualityGate = $true } }
+      # --dev: autonomia maxima con red de seguridad real (tests del proyecto).
+      '--dev' {
+        $opts.dev = $true
+        $opts.agentMode = 'autopilot'
+        $opts.qualityGate = $true
+        if (-not $opts.mode) { $opts.mode = 'trusted' }
+        if (-not $opts.effort) { $opts.effort = 'high' }
+        if ((ConvertTo-IntValue $opts.maxContinues 0) -le 0) { $opts.maxContinues = 15 }
+      }
       '--max-credits' { $i++; if ($i -lt $tokens.Count) { $opts.maxCredits = ConvertTo-IntValue $tokens[$i] 0 } }
       '--timeout'  { $i++; if ($i -lt $tokens.Count) { $opts.timeoutSec = ConvertTo-IntValue $tokens[$i] 0 } }
       '--json'     { $opts.output = 'json' }
@@ -982,6 +1196,7 @@ function Write-AskResult([hashtable]$res, [hashtable]$settings, [hashtable]$opts
       issues = @($res.issues)
       tools = $tools
       filesModified = @($res.filesModified)
+      quality = Get-Prop $res 'quality'
       usage = $res['usage']
       text = $res.text
     } | ConvertTo-Json -Depth 8
@@ -1003,6 +1218,15 @@ function Write-AskResult([hashtable]$res, [hashtable]$settings, [hashtable]$opts
   if (-not $res.verified) {
     Write-Host '[ask-cli] SIN VERIFICAR:' -ForegroundColor Red
     foreach ($i in $res.issues) { Write-Host ('  - ' + $i) -ForegroundColor Red }
+  }
+  $q = Get-Prop $res 'quality'
+  if ($q) {
+    if ($q.ok) {
+      Write-Host ("[ask-cli] calidad OK: " + $q.command + " (" + $q.ms + " ms)") -ForegroundColor Green
+    } else {
+      Write-Host ("[ask-cli] CALIDAD FALLIDA: " + $q.command + " (exit " + $q.exitCode + ")") -ForegroundColor Red
+      foreach ($l in ($q.output -split "`n" | Select-Object -Last 12)) { Write-Host ('  ' + $l.TrimEnd()) -ForegroundColor DarkRed }
+    }
   }
   if ($res.resume) { Write-Host ("resume: " + $res.resume) -ForegroundColor DarkGray }
 }
@@ -1244,6 +1468,20 @@ switch ($cmd) {
     $docSettings = Resolve-Settings $cfg (Parse-Options @($Args | Select-Object -Skip 1))
     $permArgs = (Build-PermissionArgs $docSettings) -join ' '
     Write-Host ("permisos: modo=" + $docSettings.mode + " -> " + $permArgs)
+    $agentArgs = (Build-AgentArgs $docSettings) -join ' '
+    Write-Host ("agente: modo=" + $docSettings.agentMode + $(if ($agentArgs) { " -> " + $agentArgs } else { " (sin flags agenticos)" }))
+    if ($docSettings.effort -and (-not $docSettings.model -or $docSettings.model -eq 'auto')) {
+      Write-Host ("effort: WARN el modelo 'auto' no admite --effort; se degradara en ejecucion (fija --model para usarlo)")
+    }
+    $qDir = if ($docSettings.dir) { $docSettings.dir } else { (Get-Location).Path }
+    $qc = Get-QualityCommand $qDir ([string]$docSettings.verifyCommand)
+    if (-not (ConvertTo-BoolValue $docSettings.qualityGate $false)) {
+      Write-Host ("calidad: OFF (activalo con --quality o --dev)" + $(if ($qc) { "; suite detectada: " + $qc.cmd } else { '' }))
+    } elseif ($qc) {
+      Write-Host ("calidad: ON stack=" + $qc.name + " -> " + $qc.cmd)
+    } else {
+      Write-Host "calidad: ON pero WARN sin suite detectada (define verifyCommand o --verify-cmd)"
+    }
     Write-Host ("retry: " + $(if (ConvertTo-BoolValue $cfg.retry $true) { 'ON (reintento sobre la misma sesion)' } else { 'OFF' }))
     $gm = if ($cfg.guard) { [string]$cfg.guard } else { 'auto' }
     $gdir = (Get-Location).Path

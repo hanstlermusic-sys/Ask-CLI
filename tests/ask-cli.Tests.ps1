@@ -688,3 +688,206 @@ Describe 'Rendimiento del filtrado' {
         $sw.ElapsedMilliseconds | Should -BeLessThan 1000
     }
 }
+
+Describe 'v0.5.0 - flags agenticos' {
+  It 'no emite flags en modo interactive por defecto' {
+    @(Build-AgentArgs @{ agentMode='interactive'; effort=''; assistedApproval=$false; noAskUser=$false; maxContinues=0 }).Count | Should -Be 0
+  }
+  It 'emite --mode autopilot y max-continues' {
+    $a = Build-AgentArgs @{ agentMode='autopilot'; effort='high'; assistedApproval=$false; noAskUser=$false; maxContinues=15 }
+    ($a -join ' ') | Should -Be '--mode autopilot --max-autopilot-continues 15 --effort high'
+  }
+  It 'no emite max-continues fuera de autopilot' {
+    (Build-AgentArgs @{ agentMode='plan'; effort=''; assistedApproval=$false; noAskUser=$false; maxContinues=9 }) -join ' ' | Should -Be '--mode plan'
+  }
+  It 'assisted-approval siempre viaja con --experimental' {
+    $a = Build-AgentArgs @{ agentMode='autopilot'; effort=''; assistedApproval=$true; noAskUser=$false; maxContinues=0 }
+    $a | Should -Contain '--experimental'
+    $a.IndexOf('--experimental') | Should -BeLessThan $a.IndexOf('--assisted-approval')
+  }
+  It 'emite --no-ask-user' {
+    (Build-AgentArgs @{ agentMode='interactive'; effort=''; assistedApproval=$false; noAskUser=$true; maxContinues=0 }) | Should -Contain '--no-ask-user'
+  }
+}
+
+Describe 'v0.5.0 - parseo de opciones' {
+  It '--dev activa autopilot, calidad, trusted y effort high' {
+    $o = Parse-Options @('--dev','hola')
+    $o.agentMode | Should -Be 'autopilot'
+    $o.qualityGate | Should -BeTrue
+    $o.mode | Should -Be 'trusted'
+    $o.effort | Should -Be 'high'
+    $o.maxContinues | Should -Be 15
+  }
+  It '--dev no pisa un effort explicito previo' {
+    (Parse-Options @('--effort','max','--dev','x')).effort | Should -Be 'max'
+  }
+  It '--autopilot y --plan son atajos' {
+    (Parse-Options @('--autopilot','x')).agentMode | Should -Be 'autopilot'
+    (Parse-Options @('--plan','x')).agentMode | Should -Be 'plan'
+  }
+  It '--verify-cmd implica gate de calidad' {
+    $o = Parse-Options @('--verify-cmd','npm test','x')
+    $o.verifyCommand | Should -Be 'npm test'
+    $o.qualityGate | Should -BeTrue
+  }
+  It '--no-quality desactiva el gate' { (Parse-Options @('--no-quality','x')).quality | Should -BeFalse }
+}
+
+Describe 'v0.5.0 - validacion en Resolve-Settings' {
+  It 'rechaza effort invalido' {
+    { Resolve-Settings (Default-Config) (Parse-Options @('--effort','turbo','x')) } | Should -Throw '*effort invalido*'
+  }
+  It 'rechaza agent-mode invalido' {
+    { Resolve-Settings (Default-Config) (Parse-Options @('--agent-mode','yolo','x')) } | Should -Throw '*agentMode invalido*'
+  }
+  It 'acepta todos los niveles validos de effort' {
+    foreach ($e in @('none','minimal','low','medium','high','xhigh','max')) {
+      (Resolve-Settings (Default-Config) (Parse-Options @('--effort',$e,'x'))).effort | Should -Be $e
+    }
+  }
+  It 'la CLI tiene precedencia sobre la config' {
+    $c = Default-Config; $c.agentMode = 'plan'
+    (Resolve-Settings $c (Parse-Options @('--autopilot','x'))).agentMode | Should -Be 'autopilot'
+  }
+}
+
+Describe 'v0.5.0 - deteccion de stack' {
+  BeforeAll {
+    $script:tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('q-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $script:tmp | Out-Null
+  }
+  AfterAll { Remove-Item $script:tmp -Recurse -Force -ErrorAction SilentlyContinue }
+
+  It 'un override explicito gana sobre cualquier deteccion' {
+    (Get-QualityCommand $script:tmp 'mi-comando').cmd | Should -Be 'mi-comando'
+    (Get-QualityCommand $script:tmp 'mi-comando').name | Should -Be 'custom'
+  }
+  It 'devuelve null sin marcadores' { Get-QualityCommand $script:tmp '' | Should -BeNullOrEmpty }
+  It 'detecta node por package.json' {
+    $d = Join-Path $script:tmp 'n'; New-Item -ItemType Directory -Path $d | Out-Null
+    '{}' | Set-Content (Join-Path $d 'package.json')
+    (Get-QualityCommand $d '').name | Should -Be 'node'
+  }
+  It 'detecta python por pyproject.toml' {
+    $d = Join-Path $script:tmp 'py'; New-Item -ItemType Directory -Path $d | Out-Null
+    '' | Set-Content (Join-Path $d 'pyproject.toml')
+    (Get-QualityCommand $d '').cmd | Should -Be 'python -m pytest -q'
+  }
+  It 'detecta go por go.mod' {
+    $d = Join-Path $script:tmp 'g'; New-Item -ItemType Directory -Path $d | Out-Null
+    'module x' | Set-Content (Join-Path $d 'go.mod')
+    (Get-QualityCommand $d '').name | Should -Be 'go'
+  }
+  It 'detecta rust por Cargo.toml' {
+    $d = Join-Path $script:tmp 'r'; New-Item -ItemType Directory -Path $d | Out-Null
+    '' | Set-Content (Join-Path $d 'Cargo.toml')
+    (Get-QualityCommand $d '').name | Should -Be 'rust'
+  }
+  It 'pester tiene prioridad sobre node en un repo mixto' {
+    $d = Join-Path $script:tmp 'mix'; New-Item -ItemType Directory -Path $d | Out-Null
+    '{}' | Set-Content (Join-Path $d 'package.json')
+    '' | Set-Content (Join-Path $d 'a.Tests.ps1')
+    (Get-QualityCommand $d '').name | Should -Be 'pester'
+  }
+  It 'no revienta con un directorio inexistente' {
+    Get-QualityCommand (Join-Path $script:tmp 'no-existe') '' | Should -BeNullOrEmpty
+  }
+}
+
+Describe 'v0.5.0 - ejecucion del gate de calidad' {
+  It 'reporta ok con un comando que sale 0' {
+    $g = Invoke-QualityGate (Get-Location).Path 'cmd /c exit 0' 60
+    $g.ok | Should -BeTrue
+    $g.exitCode | Should -Be 0
+  }
+  It 'reporta fallo y captura la salida' {
+    $g = Invoke-QualityGate (Get-Location).Path 'cmd /c "echo TEST_FALLA_AQUI & exit 7"' 60
+    $g.ok | Should -BeFalse
+    $g.exitCode | Should -Be 7
+    $g.output | Should -Match 'TEST_FALLA_AQUI'
+  }
+  It 'restaura el directorio de trabajo incluso al fallar' {
+    $before = (Get-Location).Path
+    Invoke-QualityGate $env:TEMP 'cmd /c exit 1' 60 | Out-Null
+    (Get-Location).Path | Should -Be $before
+  }
+  It 'no lanza excepcion con un comando inexistente' {
+    { Invoke-QualityGate (Get-Location).Path 'comando-que-no-existe-xyz' 60 } | Should -Not -Throw
+  }
+}
+
+Describe 'v0.5.0 - feedback de calidad' {
+  It 'incluye comando, exit y salida real' {
+    $f = Build-QualityFeedback @{ command='npm test'; exitCode=1; output='2 failing'; ok=$false }
+    $f | Should -Match 'npm test'
+    $f | Should -Match '2 failing'
+    $f | Should -Match 'VERIFICACION DEL PROYECTO HA FALLADO'
+  }
+  It 'prohibe explicitamente falsear los tests' {
+    Build-QualityFeedback @{ command='x'; exitCode=1; output='y'; ok=$false } | Should -Match 'No modifiques ni desactives los tests'
+  }
+}
+
+Describe 'v0.5.0 - Get-Prop sobre hashtables' {
+  It 'lee claves de hashtable' { Get-Prop @{ a = 42 } 'a' | Should -Be 42 }
+  It 'devuelve null en clave ausente sin lanzar' { Get-Prop @{ a = 1 } 'zzz' | Should -BeNullOrEmpty }
+  It 'permite que una config antigua sin qualityGate no rompa' {
+    ConvertTo-BoolValue (Get-Prop @{ mode = 'trusted' } 'qualityGate') $false | Should -BeFalse
+  }
+}
+
+Describe 'v0.5.0 - degradacion de --effort en modelos incompatibles' {
+  BeforeAll {
+    $script:base = @{
+      provider='copilot'; model='auto'; mode='trusted'; output='text'; dir=''
+      allowTools=''; denyTools=''; timeoutSec=180; agent=''; maxCredits=0; guard='off'
+      agentMode='autopilot'; effort='high'; assistedApproval=$false; noAskUser=$false
+      maxContinues=0; qualityGate=$false; verifyCommand=''
+    }
+    $script:opts = @{ resume=''; quiet=$true; verify=$false; retry=$false; quality=$false; attachments=@(); addDirs=@() }
+  }
+
+  It 'reintenta sin effort cuando el modelo lo rechaza' {
+    $script:calls = New-Object System.Collections.Generic.List[object]
+    Mock Invoke-CopilotPrompt {
+      $script:calls.Add(@{ effort = $settings.effort })
+      if ($settings.effort) {
+        return @{ code=1; text=''; resume='s1'; raw='Error: Model "auto" does not support reasoning effort configuration (requested: "high").'
+                  toolCalls=(New-Object System.Collections.Generic.List[object]); toolFailed=0; filesModified=@(); usage=@{} }
+      }
+      return @{ code=0; text='HOLA'; resume='s2'; raw=''
+                toolCalls=(New-Object System.Collections.Generic.List[object]); toolFailed=0; filesModified=@(); usage=@{} }
+    }
+    $r = Invoke-AskPrompt 'di hola' $script:base $script:opts @{ verify=$false; retry=$false }
+    $script:calls.Count | Should -Be 2
+    $script:calls[0].effort | Should -Be 'high'
+    $script:calls[1].effort | Should -BeNullOrEmpty
+    $r.code | Should -Be 0
+  }
+
+  It 'no degrada ante un fallo por otra causa' {
+    $script:calls2 = New-Object System.Collections.Generic.List[object]
+    Mock Invoke-CopilotPrompt {
+      $script:calls2.Add(1)
+      return @{ code=1; text=''; resume='s1'; raw='Error: network unreachable'
+                toolCalls=(New-Object System.Collections.Generic.List[object]); toolFailed=0; filesModified=@(); usage=@{} }
+    }
+    Invoke-AskPrompt 'di hola' $script:base $script:opts @{ verify=$false; retry=$false } | Out-Null
+    $script:calls2.Count | Should -Be 1
+  }
+
+  It 'no muta el hashtable de settings del llamador' {
+    Mock Invoke-CopilotPrompt {
+      if ($settings.effort) {
+        return @{ code=1; text=''; resume='s1'; raw='does not support reasoning effort'
+                  toolCalls=(New-Object System.Collections.Generic.List[object]); toolFailed=0; filesModified=@(); usage=@{} }
+      }
+      return @{ code=0; text='ok'; resume='s2'; raw=''
+                toolCalls=(New-Object System.Collections.Generic.List[object]); toolFailed=0; filesModified=@(); usage=@{} }
+    }
+    $s = @{} ; foreach ($k in $script:base.Keys) { $s[$k] = $script:base[$k] }
+    Invoke-AskPrompt 'di hola' $s $script:opts @{ verify=$false; retry=$false } | Out-Null
+    $s.effort | Should -Be 'high'
+  }
+}

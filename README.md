@@ -158,8 +158,73 @@ ask-cli run "haz commit" --trusted --deny-tool "shell(git push)"
 > `read_powershell`, `list_powershell` y `task`. Si necesitas contención real usa `safe` con una lista blanca
 > explícita, que es cerrada por construcción, en lugar de una lista negra.
 
-## Configuración
+## Modo dev autónomo
 
+`--dev` es el atajo recomendado para "hazlo tú". Combina autonomía de ejecución con una red de
+seguridad que no depende de lo que el modelo *diga*:
+
+```powershell
+ask-cli run "corrige el bug de la funcion add en calc.py" --dev
+```
+
+Equivale a `--autopilot --trusted --effort high --quality --max-continues 15`.
+
+### Qué aporta frente a `copilot --autopilot`
+
+Copilot CLI da por terminada la tarea cuando el modelo emite `task_complete`. Nadie comprueba que
+el proyecto siga compilando o que los tests pasen. ask-cli sí:
+
+1. El agente trabaja hasta declararse completo.
+2. Si tocó código, ask-cli **ejecuta la suite real del proyecto**.
+3. Si falla, le devuelve la salida literal del test (no un resumen) sobre la misma sesión y le exige
+   corregir la causa raíz, prohibiendo explícitamente tocar los tests para forzar un verde.
+4. Vuelve a ejecutar la suite. Solo entonces sale con `0`.
+
+Ejemplo real: ante `add` (bug) y `divide` (sin validar división por cero), pidiendo *sólo* arreglar
+`add`, el agente arregló `add` y emitió `task_complete`. El gate detectó que `test_divide_by_zero`
+seguía roja, se lo devolvió, y el agente corrigió también `divide`. Sin el gate, la corrida habría
+terminado en verde con la suite en rojo.
+
+### Detección de la suite
+
+Se elige el primer marcador presente, de más específico a más genérico:
+
+| Stack | Marcador | Comando |
+|---|---|---|
+| Pester | `*.Tests.ps1` | `Invoke-Pester -Path . -Output None -CI` |
+| Node | `package.json` | `npm test --silent` |
+| Python | `pyproject.toml`, `pytest.ini`, `setup.cfg`, `tests/` | `python -m pytest -q` |
+| .NET | `*.sln`, `*.csproj` | `dotnet test --nologo -v q` |
+| Go | `go.mod` | `go test ./...` |
+| Rust | `Cargo.toml` | `cargo test --quiet` |
+
+Con `--verify-cmd "<comando>"` (o `verifyCommand` en config) fijas el tuyo y te saltas la detección.
+Si no hay suite detectable, el gate se omite con un aviso: nunca bloquea por no encontrar tests.
+
+### Autonomía del agente
+
+| Opción | Efecto |
+|---|---|
+| `--dev` | Atajo recomendado (ver arriba). |
+| `--autopilot` | El agente itera solo hasta terminar. |
+| `--plan` | Solo planifica; no ejecuta cambios. |
+| `--effort <nivel>` | `none`...`max`. Ver aviso abajo. |
+| `--max-continues <n>` | Iteraciones máximas de autopilot (default de Copilot: 5). |
+| `--assisted-approval` | Juez de aprobación de Copilot (experimental). |
+| `--no-ask-user` | Prohíbe al agente preguntar; falla en vez de bloquearse. |
+| `--quality` / `--no-quality` | Fuerza o desactiva el gate de calidad. |
+
+> **`--effort` y el modelo `auto`.** El modelo por defecto rechaza la configuración de reasoning
+> effort y aborta la corrida entera. ask-cli lo detecta y **reintenta automáticamente sin el flag**
+> en vez de fallar. Para usar `--effort` de verdad, fija un modelo que lo soporte con `--model`.
+> `ask-cli doctor` avisa de esta combinación.
+
+> **`--assisted-approval` no es una barrera de seguridad.** El flag se ignora en silencio sin
+> `--experimental` (ask-cli siempre los emite juntos). Aun activándolo correctamente, en pruebas el
+> juez **aprobó el borrado permanente de archivos**. Para contención real usa el modo `safe` con
+> lista blanca; no confíes en el juez.
+
+## Configuración
 Archivos en `~/.ask-cli/`:
 
 - `config.json` — configuración global (UTF-8 sin BOM).
@@ -184,6 +249,13 @@ Archivos en `~/.ask-cli/`:
 | `guard` | `auto` | `auto` (omite el guard si está en `AGENTS.md`), `always`, `off`. |
 | `agent` | `` | Agente custom de Copilot CLI. |
 | `maxCredits` | `0` | Límite de AI credits premium (0 = sin límite). |
+| `agentMode` | `interactive` | `interactive`, `plan` o `autopilot`. |
+| `effort` | `` | Nivel de reasoning effort (`none`…`max`). |
+| `assistedApproval` | `false` | Juez de aprobación experimental de Copilot. |
+| `maxContinues` | `0` | Iteraciones máximas de autopilot (0 = default de Copilot). |
+| `noAskUser` | `false` | Prohíbe al agente hacer preguntas. |
+| `qualityGate` | `false` | Ejecuta la suite del proyecto tras tocar código. |
+| `verifyCommand` | `` | Comando de verificación explícito (omite la detección). |
 
 ### Códigos de salida
 
@@ -191,7 +263,7 @@ Archivos en `~/.ask-cli/`:
 |---|---|
 | `0` | Éxito verificado. |
 | `1` | Error de uso o del provider. |
-| `3` | La respuesta no superó la verificación tras el reintento. |
+| `3` | La respuesta no superó la verificación tras el reintento, o el gate de calidad quedó en rojo. |
 
 ## Perfiles por proyecto
 
@@ -272,6 +344,10 @@ una variable automática con la ruta del perfil. Funcionaba por sombreado local,
   (una pregunta redactada como orden) que provoquen un reintento innecesario; `--no-verify` lo desactiva.
 - `--deny-tool` excluye por **nombre exacto de herramienta**, no por capacidad: excluir `powershell` no impide
   que el modelo recurra a `read_powershell` o `task`. Para contención real usa `safe` con lista blanca.
+- El gate de calidad ejecuta el comando detectado **en tu máquina**, con tus permisos. Revisa
+  `ask-cli doctor` antes de usar `--dev` en un repo desconocido.
+- `--effort` es incompatible con el modelo `auto`; ask-cli degrada automáticamente (ver arriba).
+- `--assisted-approval` no contiene operaciones destructivas; no lo uses como control de seguridad.
 - Windows-first: se resuelve `copilot.cmd` y se usan rutas con `\`.
 
 ## Desarrollo
