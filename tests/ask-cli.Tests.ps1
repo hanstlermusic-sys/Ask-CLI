@@ -766,7 +766,7 @@ Describe 'v0.5.0 - deteccion de stack' {
   It 'devuelve null sin marcadores' { Get-QualityCommand $script:tmp '' | Should -BeNullOrEmpty }
   It 'detecta node por package.json' {
     $d = Join-Path $script:tmp 'n'; New-Item -ItemType Directory -Path $d | Out-Null
-    '{}' | Set-Content (Join-Path $d 'package.json')
+    '{ "scripts": { "test": "jest" } }' | Set-Content (Join-Path $d 'package.json')
     (Get-QualityCommand $d '').name | Should -Be 'node'
   }
   It 'detecta python por pyproject.toml' {
@@ -786,7 +786,7 @@ Describe 'v0.5.0 - deteccion de stack' {
   }
   It 'pester tiene prioridad sobre node en un repo mixto' {
     $d = Join-Path $script:tmp 'mix'; New-Item -ItemType Directory -Path $d | Out-Null
-    '{}' | Set-Content (Join-Path $d 'package.json')
+    '{ "scripts": { "test": "jest" } }' | Set-Content (Join-Path $d 'package.json')
     '' | Set-Content (Join-Path $d 'a.Tests.ps1')
     (Get-QualityCommand $d '').name | Should -Be 'pester'
   }
@@ -935,7 +935,7 @@ Describe 'v0.5.0 - deteccion inmune a dependencias de terceros' {
   BeforeAll {
     $script:vd = Join-Path ([System.IO.Path]::GetTempPath()) ('vend-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path (Join-Path $script:vd 'node_modules\lib\test') -Force | Out-Null
-    '{}' | Set-Content (Join-Path $script:vd 'package.json')
+    '{ "scripts": { "test": "jest" } }' | Set-Content (Join-Path $script:vd 'package.json')
     '' | Set-Content (Join-Path $script:vd 'node_modules\lib\test\Vendor.Tests.ps1')
   }
   AfterAll { Remove-Item $script:vd -Recurse -Force -ErrorAction SilentlyContinue }
@@ -1183,5 +1183,80 @@ Describe 'v0.6.0 - todo comando del switch esta en la lista de comandos conocido
 
         $huerfanos = @($cases | Where-Object { $registered -notcontains $_ })
         $huerfanos -join ',' | Should -BeNullOrEmpty
+    }
+}
+
+
+Describe 'v0.6.1 - package.json sin tests no debe bloquear el gate' {
+    BeforeAll {
+        $script:PkgDir = Join-Path $TestDrive 'pkg'
+        New-Item -ItemType Directory -Path $script:PkgDir -Force | Out-Null
+    }
+
+    It 'ignora un package.json sin bloque scripts' {
+        '{ "name": "x", "version": "1.0.0" }' | Set-Content (Join-Path $script:PkgDir 'package.json')
+        Test-HasNpmTest $script:PkgDir | Should -BeFalse
+    }
+
+    It 'ignora el placeholder que genera npm init' {
+        '{ "scripts": { "test": "echo \"Error: no test specified\" && exit 1" } }' | Set-Content (Join-Path $script:PkgDir 'package.json')
+        Test-HasNpmTest $script:PkgDir | Should -BeFalse
+    }
+
+    It 'ignora un package.json con scripts pero sin test (caso hansters)' {
+        '{ "scripts": { "start": "electron .", "dist": "electron-builder" } }' | Set-Content (Join-Path $script:PkgDir 'package.json')
+        Test-HasNpmTest $script:PkgDir | Should -BeFalse
+        Get-QualityCommand $script:PkgDir '' | Should -BeNullOrEmpty
+    }
+
+    It 'acepta un script de test real' {
+        '{ "scripts": { "test": "jest" } }' | Set-Content (Join-Path $script:PkgDir 'package.json')
+        Test-HasNpmTest $script:PkgDir | Should -BeTrue
+        (Get-QualityCommand $script:PkgDir '').name | Should -Be 'node'
+    }
+
+    It 'no revienta con un package.json corrupto' {
+        '{ esto no es json' | Set-Content (Join-Path $script:PkgDir 'package.json')
+        Test-HasNpmTest $script:PkgDir | Should -BeFalse
+    }
+}
+
+Describe 'v0.6.1 - la salida del gate no se envia serializada en CLIXML' {
+    It 'elimina la cabecera y los objetos de progreso' {
+        $lines = @(
+            '#< CLIXML',
+            '<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><MS><PR N="Record"><AV>Preparing modules for first use.</AV></PR></MS></Obj></Objs>',
+            'FAILED test_net.py::test_uno'
+        )
+        $out = Format-GateOutput $lines
+        ($out -join ' ') | Should -Not -Match 'CLIXML'
+        ($out -join ' ') | Should -Not -Match '<Objs'
+        ($out -join ' ') | Should -Match 'FAILED test_net'
+    }
+
+    It 'rescata el texto real que el XML lleva dentro' {
+        $lines = @('<Objs Version="1.1.0.1"><S S="Error">AssertionError: se esperaba 200</S></Objs>')
+        (Format-GateOutput $lines) -join ' ' | Should -Match 'AssertionError: se esperaba 200'
+    }
+
+    It 'decodifica entidades y saltos de linea escapados' {
+        $lines = @('<Objs Version="1.1.0.1"><S S="Error">a &amp; b_x000D__x000A_siguiente</S></Objs>')
+        $out = (Format-GateOutput $lines) -join ' '
+        $out | Should -Match 'a & b'
+        $out | Should -Not -Match '_x000D_'
+    }
+
+    It 'deja intacta una salida normal' {
+        $lines = @('3 passed in 0.05s', '')
+        (Format-GateOutput $lines)[0] | Should -Be '3 passed in 0.05s'
+    }
+
+    It 'el gate real ya no emite CLIXML pero conserva el mensaje' {
+        $d = Join-Path $TestDrive 'gate-clixml'
+        New-Item -ItemType Directory -Path $d -Force | Out-Null
+        $g = Invoke-QualityGate $d 'Write-Error "MARCADOR_UNICO_XYZ"; exit 1' 60
+        $g.ok | Should -BeFalse
+        $g.output | Should -Not -Match '<Objs Version'
+        $g.output | Should -Match 'MARCADOR_UNICO_XYZ'
     }
 }

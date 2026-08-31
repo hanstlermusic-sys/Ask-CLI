@@ -12,7 +12,7 @@ $ConfigPath = Join-Path $AskHome 'config.json'
 $HistoryPath = Join-Path $AskHome 'history.jsonl'
 $ProfilesPath = Join-Path $AskHome 'project-profiles.json'
 
-$script:AskCliVersion = '0.6.0'
+$script:AskCliVersion = '0.6.1'
 $script:ResolvedCopilot = ''
 $script:Invoker = $null
 $script:Cfg = $null
@@ -652,10 +652,31 @@ function Find-ProjectFile([string]$dir, [string[]]$include) {
   return [bool]$found
 }
 
+# Un package.json NO implica que haya tests. npm crea por defecto un script test
+# que solo imprime "no test specified" y sale con 1, y muchos proyectos ni lo
+# definen. Detectar node por la mera presencia del fichero hacia que el gate
+# fallara SIEMPRE en esos repos: cada corrida terminaba en exit 3 por un fallo
+# que el agente no podia arreglar. Sin script util, es preferible omitir el gate
+# (y avisar) que bloquear el trabajo.
+function Test-HasNpmTest([string]$dir) {
+  $pkg = Join-Path $dir 'package.json'
+  if (-not (Test-Path $pkg)) { return $false }
+  try {
+    $json = Get-Content $pkg -Raw -ErrorAction Stop | ConvertFrom-Json
+    $scripts = Get-Prop $json 'scripts'
+    if ($null -eq $scripts) { return $false }
+    $t = [string](Get-Prop $scripts 'test')
+    if (-not $t) { return $false }
+    # El placeholder que genera 'npm init' no ejecuta nada.
+    if ($t -match 'no test specified') { return $false }
+    return $true
+  } catch { return $false }
+}
+
 $script:QualityProbes = @(
   @{ name = 'pester';  marker = { param($d) Find-ProjectFile $d @('*.Tests.ps1') }
      cmd = 'Invoke-Pester -Path . -Output None -CI' }
-  @{ name = 'node';    marker = { param($d) Test-Path (Join-Path $d 'package.json') }
+  @{ name = 'node';    marker = { param($d) Test-HasNpmTest $d }
      cmd = 'npm test --silent' }
   @{ name = 'python';  marker = { param($d) (Test-Path (Join-Path $d 'pytest.ini')) -or (Test-Path (Join-Path $d 'pyproject.toml')) -or (Test-Path (Join-Path $d 'setup.cfg')) -or (Test-Path (Join-Path $d 'tests')) -or @(Get-ChildItem $d -Filter 'test_*.py' -File -ErrorAction SilentlyContinue | Select-Object -First 1).Count -gt 0 }
      cmd = 'python -m pytest -q' }
@@ -693,7 +714,9 @@ function Invoke-QualityGate([string]$dir, [string]$command, [int]$timeoutSec) {
   $errFile = $outFile + '.err'
   # ErrorActionPreference=Stop hace que un cmdlet que escribe error termine con exit != 0;
   # sin el, Write-Error saldria como exito.
-  $inner = '$ErrorActionPreference=''Stop''; $global:LASTEXITCODE=0; try { ' + $command + ' } catch { Write-Error $_; exit 1 }; exit $LASTEXITCODE'
+  # ProgressPreference=SilentlyContinue evita que la barra de progreso se serialice
+  # en el stream de error (ver Format-GateOutput).
+  $inner = '$ErrorActionPreference=''Stop''; $ProgressPreference=''SilentlyContinue''; $global:LASTEXITCODE=0; try { ' + $command + ' } catch { Write-Error $_; exit 1 }; exit $LASTEXITCODE'
   # -EncodedCommand en vez de -Command: pasar el comando como argumento suelto lo
   # somete a un segundo parseo que destroza comillas y ampersands (un verifyCommand
   # como: pytest -k "not slow"  llegaria roto). Base64 UTF-16LE viaja intacto.
@@ -717,6 +740,7 @@ function Invoke-QualityGate([string]$dir, [string]$command, [int]$timeoutSec) {
     foreach ($f in @($outFile, $errFile)) {
       if (Test-Path $f) { $lines += @(Get-Content $f -ErrorAction SilentlyContinue) }
     }
+    $lines = @(Format-GateOutput $lines)
     # Solo interesa la cola: es donde viven los fallos y los resumenes.
     $tail = if ($lines.Count -gt 40) { $lines[-40..-1] } else { $lines }
     return @{ ok = ($exit -eq 0); exitCode = $exit; timedOut = $false; command = $command
@@ -728,6 +752,39 @@ function Invoke-QualityGate([string]$dir, [string]$command, [int]$timeoutSec) {
   } finally {
     Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
   }
+}
+
+# El stream de error de un powershell hijo NO es texto plano: viene serializado
+# como CLIXML (#< CLIXML seguido de <Objs ...>). Sin limpiarlo, esa sopa de XML
+# es lo que se le envia al agente como "salida real" del fallo: cientos de tokens
+# de ruido que ademas ocultan el mensaje que de verdad importa.
+function Format-GateOutput($lines) {
+  $out = [System.Collections.Generic.List[string]]::new()
+  foreach ($ln in @($lines)) {
+    $s = [string]$ln
+    if ($s -match '^#<\s*CLIXML') { continue }
+    if ($s -match '<Objs\s+Version=') {
+      # Rescatar el texto real que el XML lleva dentro (mensajes de error).
+      foreach ($m in [regex]::Matches($s, '<S(?:\s[^>]*)?>(.*?)</S>')) {
+        $t = $m.Groups[1].Value
+        if (-not $t) { continue }
+        # CLIXML escapa cualquier caracter problematico como _xHHHH_ (incluido el
+        # propio guion bajo, que viaja como _x005F_). Decodificar solo _x000D_ y
+        # _x000A_ dejaba el resto corrupto: MARCADOR_UNICO_XYZ llegaba como
+        # MARCADOR_UNICO_x005F_XYZ. Se decodifican todas las secuencias.
+        $t = [regex]::Replace($t, '_x([0-9A-Fa-f]{4})_', {
+          param($mm)
+          $ch = [char][Convert]::ToInt32($mm.Groups[1].Value, 16)
+          if ($ch -eq "`r" -or $ch -eq "`n") { ' ' } else { [string]$ch }
+        })
+        $t = [System.Net.WebUtility]::HtmlDecode($t).Trim()
+        if ($t) { $out.Add($t) }
+      }
+      continue
+    }
+    $out.Add($s)
+  }
+  return $out.ToArray()
 }
 
 function Build-QualityFeedback([hashtable]$gate) {
