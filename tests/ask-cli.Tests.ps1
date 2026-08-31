@@ -1041,3 +1041,147 @@ Describe 'v0.5.0 - el gate de calidad no borra la evidencia de verificacion' {
     $r.quality | Should -BeNullOrEmpty
   }
 }
+
+
+Describe 'v0.6.0 - deteccion de bucle improductivo' {
+    BeforeAll {
+        function New-Call([string]$n, [string]$sum, [bool]$prior = $false) {
+            $h = @{ id = [Guid]::NewGuid().ToString(); name = $n; summary = $sum; success = $true }
+            if ($prior) { $h['prior'] = $true }
+            return $h
+        }
+    }
+
+    It 'detecta el caso real: la misma busqueda repetida 3 veces seguidas' {
+        $calls = [System.Collections.Generic.List[object]]::new()
+        $calls.Add((New-Call 'open_browser' ''))
+        $calls.Add((New-Call 'search_in_files' 'C:\Users\czumb'))
+        $calls.Add((New-Call 'search_in_files' 'C:\Users\czumb'))
+        $calls.Add((New-Call 'search_in_files' 'C:\Users\czumb'))
+        $loop = Get-ToolLoop $calls 3
+        $loop.found | Should -BeTrue
+        $loop.name | Should -Be 'search_in_files'
+        $loop.count | Should -Be 3
+    }
+
+    It 'no marca bucle si las repeticiones NO son consecutivas (ciclo test-parche-test)' {
+        $calls = [System.Collections.Generic.List[object]]::new()
+        $calls.Add((New-Call 'powershell' 'pytest -q'))
+        $calls.Add((New-Call 'apply_patch' 'src/a.py'))
+        $calls.Add((New-Call 'powershell' 'pytest -q'))
+        $calls.Add((New-Call 'apply_patch' 'src/b.py'))
+        $calls.Add((New-Call 'powershell' 'pytest -q'))
+        (Get-ToolLoop $calls 3).found | Should -BeFalse
+    }
+
+    It 'no marca bucle con la misma herramienta y argumentos distintos' {
+        $calls = [System.Collections.Generic.List[object]]::new()
+        foreach ($f in 'a.py', 'b.py', 'c.py', 'd.py') { $calls.Add((New-Call 'view' $f)) }
+        (Get-ToolLoop $calls 3).found | Should -BeFalse
+    }
+
+    It 'respeta un umbral configurable' {
+        $calls = [System.Collections.Generic.List[object]]::new()
+        $calls.Add((New-Call 'list_dir' 'C:\tmp'))
+        $calls.Add((New-Call 'list_dir' 'C:\tmp'))
+        (Get-ToolLoop $calls 3).found | Should -BeFalse
+        (Get-ToolLoop $calls 2).found | Should -BeTrue
+    }
+
+    It 'ignora las llamadas arrastradas del turno anterior' {
+        # Si el bucle ocurrio antes del reintento y el turno nuevo es limpio,
+        # no debe seguir penalizando.
+        $calls = [System.Collections.Generic.List[object]]::new()
+        $calls.Add((New-Call 'view' 'nuevo.py'))
+        foreach ($i in 1..4) { $calls.Add((New-Call 'search_in_files' 'viejo' $true)) }
+        (Get-ToolLoop $calls 3).found | Should -BeFalse
+    }
+
+    It 'no revienta con lista vacia o con menos llamadas que el umbral' {
+        (Get-ToolLoop @() 3).found | Should -BeFalse
+        (Get-ToolLoop $null 3).found | Should -BeFalse
+    }
+
+    It 'Test-ResponseVerification falla y explica el bucle' {
+        $calls = [System.Collections.Generic.List[object]]::new()
+        foreach ($i in 1..3) { $calls.Add((New-Call 'search_in_files' 'C:\Users\czumb')) }
+        $res = @{ toolCalls = $calls; toolFailed = 0; filesModified = @('x.py'); text = 'Listo, ya lo busque.' }
+        $v = Test-ResponseVerification $res 'busca los archivos' 3
+        $v.ok | Should -BeFalse
+        ($v.issues -join ' ') | Should -Match 'Bucle improductivo'
+        $v.loop.found | Should -BeTrue
+    }
+
+    It 'el feedback prohibe repetir en vez de pedir mas ejecucion' {
+        $calls = [System.Collections.Generic.List[object]]::new()
+        foreach ($i in 1..3) { $calls.Add((New-Call 'search_in_files' 'C:\Users\czumb')) }
+        $res = @{ toolCalls = $calls; toolFailed = 0; filesModified = @(); text = 'buscando' }
+        $v = Test-ResponseVerification $res 'busca los archivos' 3
+        $fb = Build-VerificationFeedback $v $res
+        $fb | Should -Match 'NO vuelvas a llamar a search_in_files'
+        $fb | Should -Match 'DETENTE'
+        # La orden generica empeoraria el bucle: no debe aparecer.
+        $fb | Should -Not -Match 'No describas lo que harias'
+    }
+
+    It 'una corrida sana sigue pasando' {
+        $calls = [System.Collections.Generic.List[object]]::new()
+        $calls.Add((New-Call 'view' 'a.py'))
+        $calls.Add((New-Call 'apply_patch' 'a.py'))
+        $res = @{ toolCalls = $calls; toolFailed = 0; filesModified = @('a.py'); text = 'Modifique a.py' }
+        (Test-ResponseVerification $res 'arregla a.py' 3).ok | Should -BeTrue
+    }
+}
+
+Describe 'v0.6.0 - portabilidad' {
+    It 'no hay rutas absolutas de una maquina concreta' {
+        $src = Get-Content $script:ScriptPath -Raw
+        $src | Should -Not -Match 'C:\\Users\\cezumbad'
+    }
+
+    It 'la URL del backend local es configurable' {
+        (Get-HanstlersUrl @{ hanstlersUrl = 'http://otra-pc:9000' }) | Should -Be 'http://otra-pc:9000'
+    }
+
+    It 'cae a la URL por defecto si no hay config' {
+        (Get-HanstlersUrl @{}) | Should -Be 'http://127.0.0.1:8717'
+        (Get-HanstlersUrl @{ hanstlersUrl = '' }) | Should -Be 'http://127.0.0.1:8717'
+    }
+
+    It 'normaliza la barra final para no generar //api/chat' {
+        (Get-HanstlersUrl @{ hanstlersUrl = 'http://x:1/' }) | Should -Be 'http://x:1'
+    }
+
+    It 'la config por defecto trae las claves nuevas' {
+        $d = Default-Config
+        $d.loopThreshold | Should -Be 3
+        $d.hanstlersUrl | Should -Be 'http://127.0.0.1:8717'
+    }
+
+    It 'expone install y uninstall en la ayuda' {
+        $src = Get-Content $script:ScriptPath -Raw
+        $src | Should -Match 'ask-cli install'
+        $src | Should -Match "'uninstall' \{"
+    }
+}
+
+
+Describe 'v0.6.0 - todo comando del switch esta en la lista de comandos conocidos' {
+    # Anadir un case al switch sin registrarlo en la lista hace que el subcomando
+    # se envie a Copilot COMO PROMPT en vez de ejecutarse. Paso con 'install'.
+    It 'no hay comandos huerfanos' {
+        $src = Get-Content $script:ScriptPath -Raw
+        $known = [regex]::Match($src, 'if \(\$cmd -notin @\(([^)]*)\)')
+        $known.Success | Should -BeTrue
+        $registered = @([regex]::Matches($known.Groups[1].Value, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })
+
+        $body = $src.Substring($src.IndexOf('switch ($cmd) {'))
+        $quote = [char]39
+        $casePattern = "(?m)^  $quote([a-z-]+)$quote \{"
+        $cases = @([regex]::Matches($body, $casePattern) | ForEach-Object { $_.Groups[1].Value })
+        $cases.Count | Should -BeGreaterThan 5
+
+        $huerfanos = @($cases | Where-Object { $registered -notcontains $_ })
+        $huerfanos -join ',' | Should -BeNullOrEmpty
+    }
+}

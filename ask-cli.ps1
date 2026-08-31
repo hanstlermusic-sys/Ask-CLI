@@ -12,7 +12,7 @@ $ConfigPath = Join-Path $AskHome 'config.json'
 $HistoryPath = Join-Path $AskHome 'history.jsonl'
 $ProfilesPath = Join-Path $AskHome 'project-profiles.json'
 
-$script:AskCliVersion = '0.5.0'
+$script:AskCliVersion = '0.6.0'
 $script:ResolvedCopilot = ''
 $script:Invoker = $null
 $script:Cfg = $null
@@ -105,6 +105,8 @@ function Default-Config {
     noAskUser = $false
     qualityGate = $false
     verifyCommand = ''
+    loopThreshold = 3     # llamadas identicas consecutivas que se consideran bucle
+    hanstlersUrl = 'http://127.0.0.1:8717'  # backend del provider vertex (local, opcional)
     guard = 'auto'   # auto|always|off
   }
 }
@@ -472,6 +474,49 @@ function Test-IsActionableTask([string]$prompt) {
   return $script:ActionVerbRegex.IsMatch([string]$prompt)
 }
 
+# Deteccion de bucle improductivo: el agente repite la MISMA llamada con los
+# MISMOS argumentos una y otra vez sin que cambie nada. Cada llamada "tiene
+# exito", asi que ningun otro gate lo ve: la corrida parece sana mientras gira
+# en falso hasta agotar iteraciones.
+#
+# Se exigen repeticiones CONSECUTIVAS a proposito. Repetir un comando identico
+# separado por otras llamadas es normal y productivo (el ciclo test -> parche ->
+# test ejecuta la misma suite varias veces, pero con un apply_patch en medio).
+# Lo anomalo es la repeticion inmediata, sin nada entre medias que pudiera
+# haber cambiado el resultado.
+function Get-ToolLoop($toolCalls, [int]$threshold) {
+  $none = @{ found = $false; name = ''; summary = ''; count = 0 }
+  $limit = if ($threshold -gt 1) { $threshold } else { 3 }
+  # Solo se juzga el turno MAS RECIENTE. El reintento arrastra las llamadas del
+  # turno anterior para no perder evidencia, pero si el agente ya salio del
+  # bucle no debe seguir penalizado por haber caido en el antes.
+  # El @() va FUERA del pipeline: Where-Object devuelve un escalar cuando filtra
+  # a un solo elemento, y bajo Set-StrictMode acceder a .Count sobre un escalar
+  # lanza excepcion.
+  $calls = @(@($toolCalls) | Where-Object { -not (Get-Prop $_ 'prior') })
+  if ($calls.Count -lt $limit) { return $none }
+
+  $bestName = ''; $bestSummary = ''; $best = 0
+  $runName = ''; $runSummary = ''; $run = 0
+  $prev = [string]$null
+  foreach ($t in $calls) {
+    $name = [string](Get-Prop $t 'name')
+    $summary = [string](Get-Prop $t 'summary')
+    $sig = $name + "`0" + $summary
+    if ($sig -eq $prev) {
+      $run++
+    } else {
+      $run = 1; $prev = $sig; $runName = $name; $runSummary = $summary
+    }
+    if ($run -gt $best) { $best = $run; $bestName = $runName; $bestSummary = $runSummary }
+  }
+
+  if ($best -ge $limit) {
+    return @{ found = $true; name = $bestName; summary = $bestSummary; count = $best }
+  }
+  return $none
+}
+
 function Test-HasWriteTool($toolCalls) {
   foreach ($t in $toolCalls) {
     if ($script:WriteToolRegex.IsMatch([string]$t.name)) { return $true }
@@ -481,7 +526,7 @@ function Test-HasWriteTool($toolCalls) {
 
 # Verificacion determinista: no juzga el estilo de la prosa, sino la evidencia
 # de ejecucion que Copilot CLI emite en el JSONL.
-function Test-ResponseVerification([hashtable]$res, [string]$prompt) {
+function Test-ResponseVerification([hashtable]$res, [string]$prompt, [int]$loopThreshold) {
   $issues = [System.Collections.Generic.List[string]]::new()
   $actionable = Test-IsActionableTask $prompt
   $toolCount = @($res.toolCalls).Count
@@ -502,7 +547,13 @@ function Test-ResponseVerification([hashtable]$res, [string]$prompt) {
     $issues.Add('Respuesta vacia y sin ejecucion.')
   }
 
-  return @{ ok = ($issues.Count -eq 0); issues = $issues; actionable = $actionable }
+  $loop = Get-ToolLoop $res.toolCalls $loopThreshold
+  if ($loop.found) {
+    $what = $loop.name + $(if ($loop.summary) { '(' + $loop.summary + ')' } else { '' })
+    $issues.Add("Bucle improductivo: se repitio $what $($loop.count) veces seguidas con los mismos argumentos, sin nada en medio que pudiera cambiar el resultado.")
+  }
+
+  return @{ ok = ($issues.Count -eq 0); issues = $issues; actionable = $actionable; loop = $loop }
 }
 
 function Build-VerificationFeedback([hashtable]$verification, [hashtable]$res) {
@@ -517,6 +568,21 @@ function Build-VerificationFeedback([hashtable]$verification, [hashtable]$res) {
   [void]$sb.AppendLine('Problemas detectados:')
   foreach ($i in $verification.issues) { [void]$sb.AppendLine(('- ' + $i)) }
   [void]$sb.AppendLine('')
+
+  # Ante un bucle, la orden generica ("ejecuta las herramientas necesarias") es
+  # contraproducente: es justo lo que el agente cree estar haciendo. Hay que
+  # prohibir explicitamente la llamada repetida y forzar un cambio de enfoque.
+  $loop = Get-Prop $verification 'loop'
+  if ($loop -and (Get-Prop $loop 'found')) {
+    $what = [string](Get-Prop $loop 'name')
+    [void]$sb.AppendLine(('NO vuelvas a llamar a ' + $what + ' con los mismos argumentos: ya lo hiciste y el resultado no cambio.'))
+    [void]$sb.AppendLine('Estas repitiendo un paso en vez de avanzar. Haz una de estas tres cosas:')
+    [void]$sb.AppendLine('1. Usa la informacion que YA obtuviste para dar el siguiente paso distinto.')
+    [void]$sb.AppendLine('2. Si el resultado no te sirve, cambia de herramienta o de argumentos.')
+    [void]$sb.Append('3. Si estas bloqueado, DETENTE y explica que te falta y que alternativas hay. No repetir es mas util que insistir.')
+    return $sb.ToString()
+  }
+
   [void]$sb.AppendLine('Ejecuta ahora las herramientas necesarias y responde con los resultados reales obtenidos.')
   [void]$sb.Append('No describas lo que harias: hazlo.')
   return $sb.ToString()
@@ -829,9 +895,19 @@ function Invoke-CopilotPrompt([string]$prompt, [hashtable]$settings, [hashtable]
   }
 }
 
+# El backend del provider vertex es un servicio LOCAL y OPCIONAL (HanstlerS).
+# No existe en una maquina limpia, asi que la URL es configurable y su ausencia
+# no debe presentarse como un problema salvo que se vaya a usar de verdad.
+function Get-HanstlersUrl($settings) {
+  $u = [string](Get-Prop $settings 'hanstlersUrl')
+  if (-not $u) { $u = 'http://127.0.0.1:8717' }
+  return $u.TrimEnd('/')
+}
+
 function Invoke-VertexPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opts, [hashtable]$cfg) {
   $model = if ($opts.model) { $opts.model } else { $settings.vertexModel }
   if (-not $model) { $model = 'vertex-gemini-pro' }
+  $baseUrl = Get-HanstlersUrl $settings
   $convId = if ($opts.resume) { $opts.resume } else { ('askcli-' + [Guid]::NewGuid().ToString()) }
   $body = @{
     message = $prompt
@@ -849,7 +925,7 @@ function Invoke-VertexPrompt([string]$prompt, [hashtable]$settings, [hashtable]$
   $printedStream = $false
 
   try {
-    $req = [System.Net.HttpWebRequest]::Create('http://127.0.0.1:8717/api/chat')
+    $req = [System.Net.HttpWebRequest]::Create(($baseUrl.TrimEnd('/') + '/api/chat'))
     $req.Method = 'POST'
     $req.ContentType = 'application/json'
     $timeoutMs = (ConvertTo-IntValue $settings.timeoutSec 180) * 1000
@@ -908,10 +984,10 @@ function Invoke-VertexPrompt([string]$prompt, [hashtable]$settings, [hashtable]$
         $rdr.Dispose()
       } catch {}
     }
-    $msg = if ($statusCode -gt 0) { "HTTP $statusCode en HanstlerS API." } else { 'Error conectando a HanstlerS local API (:8717).' }
+    $msg = if ($statusCode -gt 0) { "HTTP $statusCode en HanstlerS API ($baseUrl)." } else { "Error conectando a HanstlerS local API ($baseUrl)." }
     return @{ code = 1; text = $msg; resume = $convId; route = $route; raw = $errBody; streamed = $printedStream }
   } catch {
-    return @{ code = 1; text = 'Error conectando a HanstlerS local API (:8717).'; resume = $convId; route = $route; raw = $_.Exception.Message; streamed = $printedStream }
+    return @{ code = 1; text = "Error conectando a HanstlerS local API ($baseUrl)."; resume = $convId; route = $route; raw = $_.Exception.Message; streamed = $printedStream }
   } finally {
     if ($printedStream -and $settings.output -ne 'json' -and -not $opts.noStream) { Write-Host '' }
     if ($reader) { try { $reader.Dispose() } catch {} }
@@ -978,10 +1054,11 @@ function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opt
 
   $wantVerify = (ConvertTo-BoolValue $opts.verify $true) -and (ConvertTo-BoolValue $cfg.verify $true)
   $wantRetry = (ConvertTo-BoolValue $opts.retry $true) -and (ConvertTo-BoolValue $cfg.retry $true)
-  $verification = @{ ok = $true; issues = @(); actionable = $false }
+  $loopThreshold = ConvertTo-IntValue (Get-Prop $settings 'loopThreshold') 3
+  $verification = @{ ok = $true; issues = @(); actionable = $false; loop = @{ found = $false } }
 
   if ($wantVerify -and $res.code -eq 0) {
-    $verification = Test-ResponseVerification $res $prompt
+    $verification = Test-ResponseVerification $res $prompt $loopThreshold
     if ((-not $verification.ok) -and $wantRetry -and $res.resume) {
       if (-not $opts.quiet) {
         Write-Notice '[ask-cli] verificacion fallida, reintentando con evidencia:' $settings
@@ -991,11 +1068,12 @@ function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opt
       $retryRes = Invoke-CopilotPrompt $feedback $settings $opts '' $res.resume
       if ($retryRes.code -eq 0) {
         # El reintento continua la misma sesion: acumulamos la evidencia de ambos turnos.
-        foreach ($t in $res.toolCalls) { $retryRes.toolCalls.Add($t) }
+        # Se marcan como 'prior' para que la deteccion de bucle juzgue solo el turno nuevo.
+        foreach ($t in $res.toolCalls) { Set-Prop $t 'prior' $true; $retryRes.toolCalls.Add($t) }
         $retryRes.toolFailed = $retryRes.toolFailed + $res.toolFailed
         if (@($retryRes.filesModified).Count -eq 0) { $retryRes.filesModified = $res.filesModified }
         $res = $retryRes
-        $verification = Test-ResponseVerification $res $prompt
+        $verification = Test-ResponseVerification $res $prompt $loopThreshold
       }
     }
   }
@@ -1019,7 +1097,7 @@ function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opt
         if (-not $opts.quiet) { Write-Notice '[ask-cli] la suite falla, devolviendo el error al agente...' $settings }
         $fix = Invoke-CopilotPrompt (Build-QualityFeedback $gate) $settings $opts '' $res.resume
         if ($fix.code -eq 0) {
-          foreach ($t in $res.toolCalls) { $fix.toolCalls.Add($t) }
+          foreach ($t in $res.toolCalls) { Set-Prop $t 'prior' $true; $fix.toolCalls.Add($t) }
           $fix.toolFailed = $fix.toolFailed + $res.toolFailed
           if (@($fix.filesModified).Count -eq 0) { $fix.filesModified = $res.filesModified }
           $res = $fix
@@ -1027,7 +1105,7 @@ function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opt
           # borra que el agente afirmara haber hecho algo que no hizo. Asignar
           # verified=$true a ciegas descartaba issues legitimos del turno anterior.
           if ($wantVerify) {
-            $verification = Test-ResponseVerification $res $prompt
+            $verification = Test-ResponseVerification $res $prompt $loopThreshold
             $res.verified = [bool]$verification.ok
             $res.issues = @($verification.issues)
           } else {
@@ -1063,6 +1141,8 @@ Uso:
   ask-cli model set <id>
   ask-cli auth status|login|logout
   ask-cli doctor
+  ask-cli install
+  ask-cli uninstall
   ask-cli version
   ask-cli init-instructions [ruta]
   ask-cli project init [ruta] [--provider ...] [--model ...] [--strict-profile|--relaxed-profile]
@@ -1305,7 +1385,7 @@ $script:Cfg = $cfg
 $cmd = [string]$Args[0]
 
 # Backward compatibility: ask-cli "pregunta"
-if ($cmd -notin @('run','chat','resume','sessions','model','auth','doctor','project','config','help','version','--version','-v','init-instructions')) {
+if ($cmd -notin @('run','chat','resume','sessions','model','auth','doctor','install','uninstall','project','config','help','version','--version','-v','init-instructions')) {
   $opts = Parse-Options @($Args)
   $settings = Resolve-Settings $cfg $opts
   try {
@@ -1497,6 +1577,58 @@ switch ($cmd) {
     Write-Host "gh CLI no encontrado para revisar estado."
     exit 1
   }
+  'install' {
+    # Instalacion portable: copia el CLI a $HOME\.ask-cli\bin y lo registra en el
+    # PATH de usuario (no requiere admin). En otra maquina basta con clonar y
+    # ejecutar esto para invocarlo como 'ask-cli' desde cualquier carpeta.
+    $binDir = Join-Path $AskHome 'bin'
+    $srcPs1 = $PSCommandPath
+    if (-not $srcPs1) { $srcPs1 = $MyInvocation.MyCommand.Path }
+    $srcDir = Split-Path -Parent $srcPs1
+    $srcCmd = Join-Path $srcDir 'ask-cli.cmd'
+
+    if ((Resolve-FullPath $srcDir) -eq (Resolve-FullPath $binDir)) {
+      Write-Host "install: ya estas ejecutando la copia instalada; nada que hacer."
+      exit 0
+    }
+    if (-not (Test-Path $srcCmd)) { Write-Host ("install: FAIL no se encontro " + $srcCmd); exit 1 }
+
+    try {
+      if (-not (Test-Path $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
+      Copy-Item $srcPs1 (Join-Path $binDir 'ask-cli.ps1') -Force
+      Copy-Item $srcCmd (Join-Path $binDir 'ask-cli.cmd') -Force
+    } catch { Write-Host ("install: FAIL copiando: " + $_.Exception.Message); exit 1 }
+    Write-Host ("install: copiado a " + $binDir)
+
+    $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+    if (-not $userPath) { $userPath = '' }
+    $entries = @($userPath -split ';' | Where-Object { $_ })
+    if ($entries -contains $binDir) {
+      Write-Host "install: PATH ya contenia la ruta"
+    } else {
+      try {
+        [Environment]::SetEnvironmentVariable('PATH', (($entries + $binDir) -join ';'), 'User')
+        Write-Host "install: anadido al PATH de usuario (abre una terminal nueva para usarlo)"
+      } catch { Write-Host ("install: WARN no se pudo modificar el PATH: " + $_.Exception.Message) }
+    }
+    Write-Host "install: listo -> ask-cli doctor"
+    exit 0
+  }
+  'uninstall' {
+    $binDir = Join-Path $AskHome 'bin'
+    if (Test-Path $binDir) {
+      try { Remove-Item $binDir -Recurse -Force; Write-Host ("uninstall: eliminado " + $binDir) }
+      catch { Write-Host ("uninstall: WARN no se pudo eliminar: " + $_.Exception.Message) }
+    } else { Write-Host "uninstall: no estaba instalado" }
+    $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+    if ($userPath) {
+      $kept = @($userPath -split ';' | Where-Object { $_ -and $_ -ne $binDir })
+      [Environment]::SetEnvironmentVariable('PATH', ($kept -join ';'), 'User')
+      Write-Host "uninstall: PATH de usuario limpiado"
+    }
+    Write-Host ("uninstall: la config en " + $AskHome + " se conserva")
+    exit 0
+  }
   'doctor' {
     Write-Host ("=== ask-cli doctor (v" + $script:AskCliVersion + ") ===")
     Write-Host ("host: PowerShell " + $PSVersionTable.PSVersion)
@@ -1515,10 +1647,19 @@ switch ($cmd) {
       }
     } catch { Write-Host "copilot: FAIL"; exit 1 }
     $vtimeout = ConvertTo-IntValue $cfg.timeoutSec 180
-    try {
-      $state = Invoke-RestMethod -Uri 'http://127.0.0.1:8717/api/state' -TimeoutSec 5
-      Write-Host ("hanstlers: OK model=" + $state.model)
-    } catch { Write-Host "hanstlers: WARN (no responde en :8717)" }
+    # El backend vertex es local y opcional: solo se sondea si el provider activo
+    # lo va a usar. En una maquina limpia no existe, y anunciarlo como WARN daba
+    # la impresion de que faltaba algo imprescindible.
+    $docProvider = [string](Get-Prop $cfg 'provider')
+    if ($docProvider -eq 'vertex') {
+      $hUrl = Get-HanstlersUrl $cfg
+      try {
+        $state = Invoke-RestMethod -Uri ($hUrl + '/api/state') -TimeoutSec 5
+        Write-Host ("hanstlers: OK model=" + $state.model + " (" + $hUrl + ")")
+      } catch { Write-Host ("hanstlers: FAIL no responde en " + $hUrl + " (provider=vertex lo necesita)") }
+    } else {
+      Write-Host "hanstlers: n/a (backend local opcional; solo lo usa provider=vertex)"
+    }
     Write-Host ("timeoutSec: " + $vtimeout + " (aplica al provider vertex)")
     Write-Host ("verify: " + $(if (ConvertTo-BoolValue $cfg.verify $true) { 'ON (gates de ejecucion; exit 3 si falla)' } else { 'OFF' }))
     $docSettings = Resolve-Settings $cfg (Parse-Options @($Args | Select-Object -Skip 1))
@@ -1539,6 +1680,7 @@ switch ($cmd) {
       Write-Host "calidad: ON pero WARN sin suite detectada (define verifyCommand o --verify-cmd)"
     }
     Write-Host ("retry: " + $(if (ConvertTo-BoolValue $cfg.retry $true) { 'ON (reintento sobre la misma sesion)' } else { 'OFF' }))
+    Write-Host ("anti-bucle: " + (ConvertTo-IntValue (Get-Prop $cfg 'loopThreshold') 3) + " llamadas identicas consecutivas")
     $gm = if ($cfg.guard) { [string]$cfg.guard } else { 'auto' }
     $gdir = (Get-Location).Path
     if (Test-HasPersistentGuard $gdir) {
@@ -1551,6 +1693,14 @@ switch ($cmd) {
     if (Test-Path $HistoryPath) {
       $hi = Get-Item $HistoryPath
       Write-Host ("history size: " + [math]::Round($hi.Length / 1KB, 1) + " KB (rotacion a " + (ConvertTo-IntValue $cfg.historyMax 2000) + " lineas sobre 2 MB)")
+    }
+    # Portabilidad: que hace falta para que esto funcione en OTRA maquina.
+    $binDir = Join-Path $AskHome 'bin'
+    $inPath = ($env:PATH -split ';') -contains $binDir
+    if ($inPath) {
+      Write-Host ("instalacion: OK en PATH (" + $binDir + ")")
+    } else {
+      Write-Host ("instalacion: no instalado (ejecutas por ruta). Usa 'ask-cli install' para invocarlo como 'ask-cli' desde cualquier carpeta")
     }
     exit 0
   }

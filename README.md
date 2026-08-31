@@ -158,6 +158,51 @@ ask-cli run "haz commit" --trusted --deny-tool "shell(git push)"
 > `read_powershell`, `list_powershell` y `task`. Si necesitas contención real usa `safe` con una lista blanca
 > explícita, que es cerrada por construcción, en lugar de una lista negra.
 
+## Instalación en cualquier máquina
+
+```powershell
+git clone https://github.com/hanstlermusic-sys/Ask-CLI.git
+cd Ask-CLI
+.\ask-cli.cmd install
+```
+
+`install` copia el CLI a `$HOME\.ask-cli\bin` y añade esa ruta al PATH **de usuario**
+(no necesita permisos de administrador). Abre una terminal nueva y ya lo invocas como
+`ask-cli` desde cualquier carpeta. `uninstall` deshace ambos pasos y **conserva la
+configuración** en `$HOME\.ask-cli`.
+
+Requisitos reales: Copilot CLI en el PATH y Node. `pwsh` 7 es opcional pero recomendado
+(el shim lo prefiere porque arranca bastante más rápido que Windows PowerShell 5.1).
+`ask-cli doctor` cierra con una línea de estado de instalación que dice exactamente qué
+falta en una máquina nueva.
+
+El provider `vertex` habla con un backend **local y opcional** (HanstlerS). Su URL sale
+de la clave de configuración `hanstlersUrl`, así que puede apuntar a otro host o puerto.
+En una máquina donde no exista, `doctor` lo reporta como `n/a` en vez de como aviso: no
+es un componente que falte, es uno que no se usa.
+
+## Detección de bucles improductivos
+
+Un agente puede repetir la misma llamada con los mismos argumentos indefinidamente. Cada
+llamada "tiene éxito", así que ningún otro gate lo ve: la corrida parece sana mientras
+gira en falso hasta agotar las iteraciones.
+
+`ask-cli` marca como fallo **N llamadas idénticas consecutivas** (mismo nombre y mismos
+argumentos; `loopThreshold`, 3 por defecto). Se exige que sean *consecutivas* a propósito:
+repetir un comando idéntico separado por otras llamadas es normal y productivo — el ciclo
+test → parche → test ejecuta la misma suite varias veces, pero con un `apply_patch` en
+medio. Lo anómalo es la repetición inmediata, sin nada que pudiera haber cambiado el
+resultado.
+
+El reintento tampoco usa el mensaje habitual. Decirle "ejecuta ahora las herramientas
+necesarias" a un agente atascado es contraproducente: es justo lo que cree estar haciendo.
+El feedback le prohíbe explícitamente repetir esa llamada y le da tres salidas: usar lo que
+ya obtuvo, cambiar de herramienta o de argumentos, o **detenerse y explicar qué le falta**.
+Rendirse con un diagnóstico es más útil que insistir.
+
+Solo se juzga el turno más reciente: si el agente cayó en un bucle y el reintento lo
+sacó, no se le sigue penalizando por ello.
+
 ## Modo dev autónomo
 
 `--dev` es el atajo recomendado para "hazlo tú". Combina autonomía de ejecución con una red de
