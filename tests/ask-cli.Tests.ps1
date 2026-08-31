@@ -259,6 +259,102 @@ Describe 'Encoding del script' {
     }
 }
 
+Describe 'Build-PermissionArgs' {
+    # --allow-tool solo pre-aprueba; sin --available-tools el modelo puede invocar
+    # cualquier herramienta (verificado: --allow-tool=glob ejecutaba powershell).
+    It 'modo safe restringe el catalogo con --available-tools' {
+        $a = Build-PermissionArgs @{ mode = 'safe'; allowTools = 'view,glob'; denyTools = '' }
+        $a | Should -Contain '--available-tools=view,glob'
+        $a | Should -Contain '--allow-tool=view,glob'
+        $a | Should -Not -Contain '--allow-all-tools'
+    }
+
+    It 'modo safe cae al default cuando allowTools esta vacio' {
+        $a = Build-PermissionArgs @{ mode = 'safe'; allowTools = ''; denyTools = '' }
+        $a | Should -Contain '--available-tools=view,glob,rg'
+    }
+
+    It 'modo trusted permite todo' {
+        $a = Build-PermissionArgs @{ mode = 'trusted'; allowTools = 'view'; denyTools = '' }
+        $a | Should -Contain '--allow-all-tools'
+        ($a -join ' ') | Should -Not -Match 'available-tools'
+    }
+
+    It 'aplica --deny-tool tambien en modo trusted' {
+        $a = Build-PermissionArgs @{ mode = 'trusted'; allowTools = ''; denyTools = 'shell(git push)' }
+        $a | Should -Contain '--allow-all-tools'
+        $a | Should -Contain '--deny-tool=shell(git push)'
+    }
+
+    # --allow-all-tools tiene precedencia sobre --deny-tool (verificado: deny-tool=powershell
+    # no impidio la ejecucion). Solo --excluded-tools saca la herramienta del catalogo.
+    It 'acompana toda denegacion con --excluded-tools' {
+        $a = Build-PermissionArgs @{ mode = 'trusted'; allowTools = ''; denyTools = 'powershell' }
+        $a | Should -Contain '--excluded-tools=powershell'
+    }
+
+    It 'excluye tambien en modo safe' {
+        $a = Build-PermissionArgs @{ mode = 'safe'; allowTools = 'view'; denyTools = 'write' }
+        $a | Should -Contain '--excluded-tools=write'
+    }
+
+    It 'omite --deny-tool cuando no hay denegaciones' {
+        ((Build-PermissionArgs @{ mode = 'safe'; allowTools = 'view'; denyTools = '' }) -join ' ') | Should -Not -Match 'deny-tool'
+    }
+
+    It 'usa la forma = (los flags tienen valor opcional en Copilot CLI)' {
+        foreach ($f in (Build-PermissionArgs @{ mode = 'safe'; allowTools = 'view'; denyTools = 'write' })) {
+            if ($f -ne '--allow-all-tools') { $f | Should -Match '=' }
+        }
+    }
+}
+
+Describe 'Write-Notice (integridad de stdout)' {
+    # Un aviso impreso en stdout durante --json rompe ConvertFrom-Json en el consumidor.
+    It 'desvia a stderr cuando la salida es JSON' {
+        $out = Write-Notice 'aviso' @{ output = 'json' } 6>&1
+        $out | Should -BeNullOrEmpty
+    }
+
+    It 'usa el host cuando la salida es texto' {
+        $out = Write-Notice 'aviso' @{ output = 'text' } 6>&1
+        ($out | Out-String) | Should -Match 'aviso'
+    }
+
+    It 'tolera settings nulo' {
+        { Write-Notice 'aviso' $null 6>&1 | Out-Null } | Should -Not -Throw
+    }
+}
+
+Describe 'ConvertTo-ToolList' {
+    It 'normaliza espacios y deduplica' {
+        ConvertTo-ToolList @('view, glob', 'glob,rg') | Should -Be 'view,glob,rg'
+    }
+    It 'ignora entradas vacias' {
+        ConvertTo-ToolList @('', 'view', $null, ' , ') | Should -Be 'view'
+    }
+    It 'tolera null' {
+        ConvertTo-ToolList $null | Should -Be ''
+    }
+    It 'preserva la sintaxis granular de Copilot CLI' {
+        ConvertTo-ToolList 'shell(git push)' | Should -Be 'shell(git push)'
+    }
+}
+
+Describe 'Resolve-Settings (denegaciones)' {
+    It 'acumula denyTools de config y CLI en vez de sobrescribir' {
+        $cfg = Default-Config
+        $cfg.mode = 'safe'; $cfg.allowTools = 'view'; $cfg.denyTools = 'shell'
+        $opts = Parse-Options @('--deny-tool', 'write')
+        (Resolve-Settings $cfg $opts).denyTools | Should -Be 'shell,write'
+    }
+
+    It 'acumula multiples --deny-tool en la misma linea' {
+        $opts = Parse-Options @('--deny-tool', 'write', '--deny-tool', 'shell')
+        $opts.denyTools | Should -Be 'write,shell'
+    }
+}
+
 Describe 'Get-Prop' {
     It 'devuelve el valor cuando existe' {
         $o = '{"a":{"b":42}}' | ConvertFrom-Json

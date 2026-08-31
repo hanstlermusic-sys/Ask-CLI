@@ -12,7 +12,7 @@ $ConfigPath = Join-Path $AskHome 'config.json'
 $HistoryPath = Join-Path $AskHome 'history.jsonl'
 $ProfilesPath = Join-Path $AskHome 'project-profiles.json'
 
-$script:AskCliVersion = '0.4.0'
+$script:AskCliVersion = '0.4.1'
 $script:ResolvedCopilot = ''
 $script:Invoker = $null
 $script:Cfg = $null
@@ -91,6 +91,7 @@ function Default-Config {
     lastVertexConvId = ''
     copilotPath = ''      # cache de la ruta resuelta de copilot.cmd
     allowTools = 'view,glob,rg'
+    denyTools = ''        # se aplica tambien en modo trusted
     agent = ''
     timeoutSec = 180
     historyMax = 2000
@@ -218,21 +219,28 @@ function Get-ActiveProfile($cfg, [string]$dir) {
 }
 
 function Resolve-Settings($cfg, [hashtable]$opts) {
-  $profile = Get-ActiveProfile $cfg $opts.dir
+  $prof = Get-ActiveProfile $cfg $opts.dir
   $out = @{}
-  $out.provider = if ($opts.provider) { $opts.provider } elseif ($profile -and $profile.provider) { [string]$profile.provider } else { [string]$cfg.provider }
-  $out.model = if ($opts.model) { $opts.model } elseif ($profile -and $profile.model) { [string]$profile.model } else { [string]$cfg.model }
-  $out.vertexModel = if ($opts.vertexModel) { $opts.vertexModel } elseif ($profile -and $profile.vertexModel) { [string]$profile.vertexModel } else { [string]$cfg.vertexModel }
-  $out.mode = if ($opts.mode) { $opts.mode } elseif ($profile -and $profile.mode) { [string]$profile.mode } else { [string]$cfg.mode }
+  $out.provider = if ($opts.provider) { $opts.provider } elseif ($prof -and $prof.provider) { [string]$prof.provider } else { [string]$cfg.provider }
+  $out.model = if ($opts.model) { $opts.model } elseif ($prof -and $prof.model) { [string]$prof.model } else { [string]$cfg.model }
+  $out.vertexModel = if ($opts.vertexModel) { $opts.vertexModel } elseif ($prof -and $prof.vertexModel) { [string]$prof.vertexModel } else { [string]$cfg.vertexModel }
+  $out.mode = if ($opts.mode) { $opts.mode } elseif ($prof -and $prof.mode) { [string]$prof.mode } else { [string]$cfg.mode }
   $out.output = if ($opts.output) { $opts.output } else { [string]$cfg.output }
-  $out.dir = if ($opts.dir) { $opts.dir } elseif ($profile -and $profile.dir) { [string]$profile.dir } else { [string]$cfg.dir }
-  $out.allowTools = if ($opts.allowTools) { [string]$opts.allowTools } elseif ($profile -and $profile.allowTools) { [string]$profile.allowTools } else { [string]$cfg.allowTools }
+  $out.dir = if ($opts.dir) { $opts.dir } elseif ($prof -and $prof.dir) { [string]$prof.dir } else { [string]$cfg.dir }
+  $out.allowTools = if ($opts.allowTools) { [string]$opts.allowTools } elseif ($prof -and $prof.allowTools) { [string]$prof.allowTools } else { [string]$cfg.allowTools }
   if (-not $out.allowTools) { $out.allowTools = 'view,glob,rg' }
+  # denyTools se ACUMULA (perfil + config + CLI): una denegacion nunca debe perderse
+  # por especificar otra en una capa distinta.
+  $denyParts = @()
+  if ($cfg.denyTools) { $denyParts += [string]$cfg.denyTools }
+  if ($prof -and $prof.denyTools) { $denyParts += [string]$prof.denyTools }
+  if ($opts.denyTools) { $denyParts += [string]$opts.denyTools }
+  $out.denyTools = ConvertTo-ToolList $denyParts
   $out.timeoutSec = if ((ConvertTo-IntValue $opts.timeoutSec 0) -gt 0) { ConvertTo-IntValue $opts.timeoutSec 180 } else { ConvertTo-IntValue $cfg.timeoutSec 180 }
   if ($out.timeoutSec -le 0) { $out.timeoutSec = 180 }
-  $out.agent = if ($opts.agent) { [string]$opts.agent } elseif ($profile -and $profile.agent) { [string]$profile.agent } else { [string]$cfg.agent }
+  $out.agent = if ($opts.agent) { [string]$opts.agent } elseif ($prof -and $prof.agent) { [string]$prof.agent } else { [string]$cfg.agent }
   $out.maxCredits = if ((ConvertTo-IntValue $opts.maxCredits 0) -gt 0) { ConvertTo-IntValue $opts.maxCredits 0 } else { ConvertTo-IntValue $cfg.maxCredits 0 }
-  $out.guard = if ($profile -and $profile.guard) { [string]$profile.guard } else { [string]$cfg.guard }
+  $out.guard = if ($prof -and $prof.guard) { [string]$prof.guard } else { [string]$cfg.guard }
   if (-not $out.guard) { $out.guard = 'auto' }
   return $out
 }
@@ -482,6 +490,43 @@ function Build-VerificationFeedback([hashtable]$verification, [hashtable]$res) {
   return $sb.ToString()
 }
 
+# Semantica real de Copilot CLI (verificada empiricamente):
+#   --allow-tool      pre-aprueba (evita el prompt) pero NO restringe el catalogo.
+#   --available-tools SOLO estas herramientas quedan disponibles para el modelo.
+#   --deny-tool       prohibe, pero --allow-all-tools tiene precedencia sobre el.
+#   --excluded-tools  quita del catalogo; es el unico que funciona junto a --allow-all-tools.
+# Por eso una denegacion se emite por partida doble: --deny-tool cubre el flujo de
+# permisos y --excluded-tools garantiza que la herramienta ni siquiera se ofrezca.
+function Build-PermissionArgs([hashtable]$settings) {
+  $a = @()
+  $deny = ConvertTo-ToolList $settings.denyTools
+  if ($settings.mode -eq 'trusted') {
+    $a += '--allow-all-tools'
+  } else {
+    $allow = ConvertTo-ToolList $settings.allowTools
+    if (-not $allow) { $allow = 'view,glob,rg' }
+    $a += ('--available-tools=' + $allow)
+    $a += ('--allow-tool=' + $allow)
+  }
+  if ($deny) {
+    $a += ('--deny-tool=' + $deny)
+    $a += ('--excluded-tools=' + $deny)
+  }
+  return $a
+}
+
+function ConvertTo-ToolList($value) {
+  if ($null -eq $value) { return '' }
+  $items = @()
+  foreach ($v in @($value)) {
+    foreach ($part in ([string]$v -split ',')) {
+      $t = $part.Trim()
+      if ($t) { $items += $t }
+    }
+  }
+  return (($items | Select-Object -Unique) -join ',')
+}
+
 function Invoke-CopilotPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opts, [string]$sessionId, [string]$resumeId) {
   $inv = Get-CopilotInvoker
   $exe = [string]$inv.exe
@@ -494,11 +539,7 @@ function Invoke-CopilotPrompt([string]$prompt, [hashtable]$settings, [hashtable]
   elseif ($sessionId) { $cargs += @('--session-id', $sessionId) }
   foreach ($a in $opts.attachments) { $cargs += @('--attachment', [string]$a) }
   foreach ($d in $opts.addDirs) { $cargs += @('--add-dir', [string]$d) }
-  if ($settings.mode -eq 'trusted') {
-    $cargs += '--allow-all-tools'
-  } else {
-    $cargs += ('--allow-tool=' + [string]$settings.allowTools)
-  }
+  $cargs += Build-PermissionArgs $settings
   $maxCredits = ConvertTo-IntValue $settings.maxCredits 0
   if ($maxCredits -gt 0) { $cargs += @('--max-ai-credits', [string]$maxCredits) }
 
@@ -522,7 +563,9 @@ function Invoke-CopilotPrompt([string]$prompt, [hashtable]$settings, [hashtable]
     $line = [string]$_
     $rawLines.Add($line)
     if (-not $line.StartsWith('{')) {
-      if ($verbose -and -not $script:NoiseRegex.IsMatch($line) -and $line.Trim()) { Write-Host $line }
+      if ($verbose -and -not $script:NoiseRegex.IsMatch($line) -and $line.Trim()) {
+        if ($stream) { Write-Host $line } else { [Console]::Error.WriteLine($line) }
+      }
       return
     }
     $ev = $null
@@ -714,6 +757,16 @@ function Invoke-VertexPrompt([string]$prompt, [hashtable]$settings, [hashtable]$
   return @{ code = $doneCode; text = $acc.Trim(); resume = $convId; route = $route; raw = $raw; streamed = $printedStream }
 }
 
+# Los avisos de progreso nunca deben ir a stdout en modo --json: contaminarian
+# el envelope y romperian cualquier consumidor que haga ConvertFrom-Json.
+function Write-Notice([string]$msg, [hashtable]$settings, [string]$color = 'Yellow') {
+  if ($settings -and $settings.output -eq 'json') {
+    [Console]::Error.WriteLine($msg)
+  } else {
+    Write-Host $msg -ForegroundColor $color
+  }
+}
+
 function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opts, [hashtable]$cfg) {
   $isVertex = ($settings.provider -eq 'vertex')
   $effective = Build-ExecutionFirstPrompt $prompt $settings
@@ -750,9 +803,8 @@ function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opt
     $verification = Test-ResponseVerification $res $prompt
     if ((-not $verification.ok) -and $wantRetry -and $res.resume) {
       if (-not $opts.quiet) {
-        Write-Host ''
-        Write-Host '[ask-cli] verificacion fallida, reintentando con evidencia:' -ForegroundColor Yellow
-        foreach ($i in $verification.issues) { Write-Host ('  - ' + $i) -ForegroundColor Yellow }
+        Write-Notice '[ask-cli] verificacion fallida, reintentando con evidencia:' $settings
+        foreach ($i in $verification.issues) { Write-Notice ('  - ' + $i) $settings }
       }
       $feedback = Build-VerificationFeedback $verification $res
       $retryRes = Invoke-CopilotPrompt $feedback $settings $opts '' $res.resume
@@ -802,7 +854,8 @@ Opciones:
   --add-dir <ruta>            Directorio extra de contexto (repetible).
   --attach <ruta>             Adjunto (repetible).
   --resume <id>               Reanuda sesion.
-  --allow-tool <lista>        Herramientas permitidas en modo safe.
+  --allow-tool <lista>        Herramientas disponibles en modo safe (restringe el catalogo).
+  --deny-tool <lista>         Herramientas prohibidas (acumulable; aplica tambien en trusted).
   --agent <nombre>            Agente custom de Copilot CLI.
   --max-credits <n>           Limite de AI credits premium por sesion.
   --timeout <seg>             Timeout de red del provider vertex.
@@ -825,13 +878,16 @@ Verificacion anti-alucinacion:
   Exit code 3 si sigue sin verificar. Usa --no-verify para desactivarlo.
 
 Notas:
-  - Modo trusted: usa --allow-all-tools. Modo safe: limita a --allow-tool (default view,glob,rg).
+  - Modo safe: --available-tools + --allow-tool (default view,glob,rg). Restringe de verdad
+    el catalogo: --allow-tool por si solo NO limita, solo evita el prompt de confirmacion.
+  - Modo trusted: --allow-all-tools, respetando --deny-tool si se especifica.
+  - Sintaxis granular soportada por Copilot CLI: --deny-tool 'shell(git push)'
   - Flags --* no reconocidos se reenvian tal cual a Copilot CLI (passthrough), p.ej. MCP.
   - Provider vertex usa HanstlerS local API en http://127.0.0.1:8717/api/chat.
   - Perfil estricto bloquea provider/model/mode/dir del proyecto; usa --force-profile-override.
   - `init-instructions` mueve el guard a AGENTS.md (cacheado por Copilot) y ahorra tokens por llamada.
   - Claves de config: provider, model, vertexModel, mode, dir, output, copilotPath,
-    allowTools, timeoutSec, historyMax, retry, verify, guard, agent, maxCredits.
+    allowTools, denyTools, timeoutSec, historyMax, retry, verify, guard, agent, maxCredits.
 '@ | Write-Host
 }
 
@@ -848,6 +904,7 @@ function Parse-Options([string[]]$tokens) {
     addDirs = @()
     passthrough = @()
     allowTools = ''
+    denyTools = ''
     agent = ''
     maxCredits = 0
     timeoutSec = 0
@@ -873,6 +930,7 @@ function Parse-Options([string[]]$tokens) {
       '--attach'   { $i++; if ($i -lt $tokens.Count) { $opts.attachments += [string]$tokens[$i] } }
       '--add-dir'  { $i++; if ($i -lt $tokens.Count) { $opts.addDirs += [string]$tokens[$i] } }
       '--allow-tool' { $i++; if ($i -lt $tokens.Count) { $opts.allowTools = [string]$tokens[$i] } }
+      '--deny-tool' { $i++; if ($i -lt $tokens.Count) { $opts.denyTools = ConvertTo-ToolList @($opts.denyTools, $tokens[$i]) } }
       '--agent'    { $i++; if ($i -lt $tokens.Count) { $opts.agent = [string]$tokens[$i] } }
       '--max-credits' { $i++; if ($i -lt $tokens.Count) { $opts.maxCredits = ConvertTo-IntValue $tokens[$i] 0 } }
       '--timeout'  { $i++; if ($i -lt $tokens.Count) { $opts.timeoutSec = ConvertTo-IntValue $tokens[$i] 0 } }
@@ -1049,8 +1107,8 @@ switch ($cmd) {
     $cpArgs = @() + $cp.prefix
     if ($settings.dir) { $cpArgs += @('-C', $settings.dir) }
     if ($settings.model) { $cpArgs += @('--model', $settings.model) }
-    if ($opts.resume) { $cpArgs += @('--resume', $opts.resume) }
-    if ($settings.mode -eq 'trusted') { $cpArgs += '--allow-all-tools' } else { $cpArgs += @('--allow-tool', [string]$settings.allowTools) }
+    if ($opts.resume) { $cpArgs += ('--resume=' + $opts.resume) }
+    $cpArgs += Build-PermissionArgs $settings
     foreach ($d in $opts.addDirs) { $cpArgs += @('--add-dir', [string]$d) }
     foreach ($p in $opts.passthrough) { $cpArgs += [string]$p }
     & $cp.exe @cpArgs
@@ -1183,6 +1241,9 @@ switch ($cmd) {
     } catch { Write-Host "hanstlers: WARN (no responde en :8717)" }
     Write-Host ("timeoutSec: " + $vtimeout + " (aplica al provider vertex)")
     Write-Host ("verify: " + $(if (ConvertTo-BoolValue $cfg.verify $true) { 'ON (gates de ejecucion; exit 3 si falla)' } else { 'OFF' }))
+    $docSettings = Resolve-Settings $cfg (Parse-Options @($Args | Select-Object -Skip 1))
+    $permArgs = (Build-PermissionArgs $docSettings) -join ' '
+    Write-Host ("permisos: modo=" + $docSettings.mode + " -> " + $permArgs)
     Write-Host ("retry: " + $(if (ConvertTo-BoolValue $cfg.retry $true) { 'ON (reintento sobre la misma sesion)' } else { 'OFF' }))
     $gm = if ($cfg.guard) { [string]$cfg.guard } else { 'auto' }
     $gdir = (Get-Location).Path

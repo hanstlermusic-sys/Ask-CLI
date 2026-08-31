@@ -104,7 +104,8 @@ Con `guard = auto` (por defecto), `ask-cli` detecta el marcador en `AGENTS.md` y
 | `--add-dir <ruta>` | Directorio extra de contexto (repetible). |
 | `--attach <ruta>` | Adjunto (repetible). |
 | `--resume <id>` | Reanuda una sesión. |
-| `--allow-tool <lista>` | Herramientas permitidas en modo `safe`. |
+| `--allow-tool <lista>` | Herramientas disponibles en modo `safe` (restringe el catálogo). |
+| `--deny-tool <lista>` | Herramientas prohibidas; acumulable, aplica también en `trusted`. |
 | `--agent <nombre>` | Agente custom de Copilot CLI. |
 | `--max-credits <n>` | Límite de AI credits premium por sesión. |
 | `--timeout <seg>` | Timeout de red del provider `vertex`. |
@@ -123,8 +124,39 @@ funcionalidad de Copilot CLI (por ejemplo configuración de servidores MCP) sin 
 
 ## Modos de permisos
 
-- `trusted` (por defecto): pasa `--allow-all-tools` a Copilot CLI.
-- `safe`: pasa `--allow-tool` con la lista de `allowTools` (por defecto `view,glob,rg`).
+Copilot CLI distingue entre *pre-aprobar* y *restringir*, y la diferencia es fácil de pasar por alto:
+
+| Flag de Copilot CLI | Efecto real |
+|---|---|
+| `--allow-tool` | Evita el prompt de confirmación. **No restringe nada.** |
+| `--available-tools` | Solo estas herramientas quedan disponibles para el modelo. |
+| `--deny-tool` | Prohíbe, pero **`--allow-all-tools` tiene precedencia sobre él**. |
+| `--excluded-tools` | Quita del catálogo; es el único que funciona junto a `--allow-all-tools`. |
+
+Verificado empíricamente: `--allow-tool=glob` con una tarea que pedía contar procesos **ejecutó `powershell`
+igualmente**. Por eso `ask-cli` construye los permisos así:
+
+- `safe`: `--available-tools=<lista> --allow-tool=<lista>` (por defecto `view,glob,rg`). Restringe de verdad.
+- `trusted` (por defecto): `--allow-all-tools`.
+- `--deny-tool <lista>`: se emite como `--deny-tool` **y** `--excluded-tools`, para que la denegación
+  sobreviva a `--allow-all-tools`. Es acumulable entre config, perfil y línea de comandos: una denegación
+  nunca se pierde por definir otra en otra capa.
+
+```powershell
+ask-cli run "audita el repo" --safe --allow-tool "view,glob,rg"
+ask-cli run "refactoriza src/" --trusted --deny-tool "powershell"
+ask-cli doctor --safe --deny-tool write   # muestra los flags exactos que se emitirian
+```
+
+Copilot CLI acepta sintaxis granular, que `ask-cli` pasa intacta:
+
+```powershell
+ask-cli run "haz commit" --trusted --deny-tool "shell(git push)"
+```
+
+> **La exclusión es por nombre de herramienta, no por capacidad.** Al excluir `powershell`, el modelo intentó
+> `read_powershell`, `list_powershell` y `task`. Si necesitas contención real usa `safe` con una lista blanca
+> explícita, que es cerrada por construcción, en lugar de una lista negra.
 
 ## Configuración
 
@@ -144,6 +176,7 @@ Archivos en `~/.ask-cli/`:
 | `output` | `text` | `text` o `json`. |
 | `copilotPath` | `` | Cache de la ruta de `copilot.cmd` (evita escanear el `PATH`). |
 | `allowTools` | `view,glob,rg` | Herramientas del modo `safe`. |
+| `denyTools` | `` | Herramientas prohibidas (acumulable con perfil y CLI). |
 | `timeoutSec` | `180` | Timeout de red del provider `vertex`. |
 | `historyMax` | `2000` | Líneas conservadas al rotar el historial. |
 | `retry` | `true` | Reintento ante verificación fallida. |
@@ -213,6 +246,21 @@ BOM UTF-8 y un test de regresión que lo verifica.
 que `--resume abc` no enlaza (`abc` se interpreta como argumento posicional). Ahora se emiten como
 `--resume=abc` y `--allow-tool=view,glob,rg`.
 
+**Modo `safe` que no restringía.** `--allow-tool` solo pre-aprueba: no limita el catálogo de herramientas.
+El modo `safe` lo usaba en solitario, así que `--safe --allow-tool glob` seguía permitiendo que el modelo
+ejecutara `powershell`. Se añadió `--available-tools`, que sí cierra el catálogo. Con el arreglo, el propio
+modelo responde *"no hay una herramienta de ejecución de PowerShell disponible en esta sesión"*.
+
+**Denegaciones ignoradas.** `--allow-all-tools` tiene precedencia sobre `--deny-tool`, de modo que una
+denegación en modo `trusted` no tenía efecto. Ahora cada denegación se emite también como `--excluded-tools`.
+
+**Avisos que rompían el JSON.** Los mensajes de progreso del reintento se escribían en stdout, corrompiendo
+la salida de `--json` (`ConvertFrom-Json` fallaba con *Invalid JSON primitive*). Ahora van a stderr.
+
+**Colisión con la variable automática `$profile`.** `Resolve-Settings` usaba `$profile`, que en PowerShell es
+una variable automática con la ruta del perfil. Funcionaba por sombreado local, pero era frágil bajo
+`Set-StrictMode`; se renombró a `$prof`.
+
 ### Limitaciones conocidas
 
 - `timeoutSec` aplica al provider `vertex`. El provider `copilot` hereda el comportamiento de Copilot CLI
@@ -222,6 +270,8 @@ que `--resume abc` no enlaza (`abc` se interpreta como argumento posicional). Ah
   siempre como verificado.
 - Los gates usan heurística léxica para decidir si una tarea es *accionable*. Puede haber falsos positivos
   (una pregunta redactada como orden) que provoquen un reintento innecesario; `--no-verify` lo desactiva.
+- `--deny-tool` excluye por **nombre exacto de herramienta**, no por capacidad: excluir `powershell` no impide
+  que el modelo recurra a `read_powershell` o `task`. Para contención real usa `safe` con lista blanca.
 - Windows-first: se resuelve `copilot.cmd` y se usan rutas con `\`.
 
 ## Desarrollo
