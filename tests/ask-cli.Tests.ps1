@@ -1,4 +1,4 @@
-#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
+﻿#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
 BeforeAll {
     $env:ASKCLI_NO_MAIN = '1'
@@ -218,17 +218,292 @@ Describe 'Filtros de salida' {
 }
 
 Describe 'Build-ExecutionFirstPrompt' {
-    It 'antepone el guard e incluye la tarea' {
-        $p = Build-ExecutionFirstPrompt 'listar archivos'
+    It 'antepone el guard e incluye la tarea (guard=always)' {
+        $p = Build-ExecutionFirstPrompt 'listar archivos' @{ guard = 'always' }
         $p | Should -Match 'INSTRUCCION OPERATIVA'
         $p | Should -Match 'TAREA:'
         $p | Should -Match 'listar archivos'
+    }
+
+    It 'guard=off devuelve el prompt intacto' {
+        Build-ExecutionFirstPrompt 'listar archivos' @{ guard = 'off' } | Should -Be 'listar archivos'
+    }
+
+    It 'guard=auto omite el guard si AGENTS.md ya lo contiene' {
+        $dir = Join-Path $TestDrive ('guard-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        Write-Utf8NoBom (Join-Path $dir 'AGENTS.md') ("# x`n" + $script:GuardMarker + "`nreglas`n" + $script:GuardMarker)
+        Build-ExecutionFirstPrompt 'listar archivos' @{ guard = 'auto'; dir = $dir } | Should -Be 'listar archivos'
+    }
+
+    It 'guard=auto antepone el guard si no hay AGENTS.md marcado' {
+        $dir = Join-Path $TestDrive ('noguard-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        Build-ExecutionFirstPrompt 'listar archivos' @{ guard = 'auto'; dir = $dir } | Should -Match 'INSTRUCCION OPERATIVA'
+    }
+}
+
+Describe 'Encoding del script' {
+    # PowerShell 5.1 interpreta un .ps1 sin BOM como ANSI: los acentos dentro de
+    # ClaimedWriteRegex/NoiseRegex se corrompen y los gates dejan de matchear.
+    It 'ask-cli.ps1 tiene BOM UTF-8' {
+        $b = [System.IO.File]::ReadAllBytes($script:ScriptPath)
+        @($b[0], $b[1], $b[2]) | Should -Be @(239, 187, 191)
+    }
+
+    It 'los acentos sobreviven a la carga en runtime' {
+        $script:ClaimedWriteRegex.IsMatch('Ya creé el archivo') | Should -BeTrue
+        $script:ClaimedWriteRegex.IsMatch('Lo modifiqué correctamente') | Should -BeTrue
+        $script:ClaimedWriteRegex.IsMatch('Añadí la sección') | Should -BeTrue
+        $script:NoiseRegex.IsMatch('En línea:12 carácter:5') | Should -BeTrue
+    }
+}
+
+Describe 'Get-Prop' {
+    It 'devuelve el valor cuando existe' {
+        $o = '{"a":{"b":42}}' | ConvertFrom-Json
+        (Get-Prop (Get-Prop $o 'a') 'b') | Should -Be 42
+    }
+
+    It 'devuelve null en propiedad inexistente bajo StrictMode' {
+        $o = '{"a":1}' | ConvertFrom-Json
+        Get-Prop $o 'noexiste' | Should -BeNullOrEmpty
+    }
+
+    It 'tolera entrada nula' {
+        Get-Prop $null 'x' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-ToolSummary' {
+    It 'extrae el argumento representativo' -TestCases @(
+        @{ json = '{"arguments":{"command":"git status"}}'; expected = 'git status' }
+        @{ json = '{"arguments":{"path":"C:\\tmp\\a.txt"}}'; expected = 'C:\tmp\a.txt' }
+        @{ json = '{"arguments":{"pattern":"foo.*bar"}}'; expected = 'foo.*bar' }
+    ) {
+        param($json, $expected)
+        Get-ToolSummary ($json | ConvertFrom-Json) | Should -Be $expected
+    }
+
+    It 'colapsa espacios y trunca a 90 chars' {
+        $long = 'x' * 200
+        $s = Get-ToolSummary (("{`"arguments`":{`"command`":`"$long`"}}") | ConvertFrom-Json)
+        $s.Length | Should -Be 93
+        $s | Should -Match '\.\.\.$'
+    }
+
+    It 'devuelve vacio sin argumentos' {
+        Get-ToolSummary ('{}' | ConvertFrom-Json) | Should -Be ''
+    }
+}
+
+Describe 'Test-IsActionableTask' {
+    It 'detecta tareas accionables' -TestCases @(
+        @{ p = 'lista los archivos del repo' }
+        @{ p = 'crea un script de build' }
+        @{ p = 'revisa el codigo de auth.ps1' }
+        @{ p = 'ejecuta los tests' }
+        @{ p = 'corrige el bug del parser' }
+        @{ p = 'list the files in this repo' }
+        @{ p = 'run the test suite' }
+    ) {
+        param($p)
+        Test-IsActionableTask $p | Should -BeTrue
+    }
+
+    It 'no marca preguntas conceptuales' -TestCases @(
+        @{ p = 'que diferencia hay entre TCP y UDP' }
+        @{ p = 'explicame la teoria de colas' }
+    ) {
+        param($p)
+        Test-IsActionableTask $p | Should -BeFalse
+    }
+}
+
+Describe 'Test-HasWriteTool' {
+    It 'detecta herramientas de escritura y shells' -TestCases @(
+        @{ n = 'create' }
+        @{ n = 'edit' }
+        @{ n = 'str_replace' }
+        @{ n = 'write_file' }
+        @{ n = 'bash' }
+        @{ n = 'powershell' }
+    ) {
+        param($n)
+        Test-HasWriteTool @(@{ name = $n }) | Should -BeTrue
+    }
+
+    It 'no marca herramientas de solo lectura' {
+        Test-HasWriteTool @(@{ name = 'view' }, @{ name = 'glob' }) | Should -BeFalse
+    }
+}
+
+Describe 'Test-ResponseVerification' {
+    BeforeAll {
+        function New-Res([hashtable]$o) {
+            $base = @{ code = 0; text = 'ok'; toolCalls = @(); toolFailed = 0; filesModified = @() }
+            foreach ($k in $o.Keys) { $base[$k] = $o[$k] }
+            return $base
+        }
+    }
+
+    It 'aprueba tarea accionable con herramientas ejecutadas' {
+        $r = New-Res @{ toolCalls = @(@{ name = 'view'; success = $true }) }
+        (Test-ResponseVerification $r 'lista los archivos').ok | Should -BeTrue
+    }
+
+    It 'GATE 1: rechaza tarea accionable sin ninguna herramienta' {
+        $r = New-Res @{ text = 'Ya revise los archivos y todo esta bien.' }
+        $v = Test-ResponseVerification $r 'revisa los archivos del repo'
+        $v.ok | Should -BeFalse
+        ($v.issues -join ' ') | Should -Match 'ninguna herramienta'
+    }
+
+    It 'aprueba pregunta conceptual sin herramientas' {
+        (Test-ResponseVerification (New-Res @{}) 'que es la teoria de colas').ok | Should -BeTrue
+    }
+
+    It 'GATE 2: rechaza si afirma escribir sin write-tool ni filesModified' {
+        $r = New-Res @{ text = 'He creado el archivo config.json con la configuracion.'; toolCalls = @(@{ name = 'view'; success = $true }) }
+        $v = Test-ResponseVerification $r 'crea config.json'
+        $v.ok | Should -BeFalse
+        ($v.issues -join ' ') | Should -Match 'escritura registrada'
+    }
+
+    It 'GATE 2 no dispara si hubo write-tool' {
+        $r = New-Res @{ text = 'He creado el archivo config.json.'; toolCalls = @(@{ name = 'create'; success = $true }) }
+        (Test-ResponseVerification $r 'crea config.json').ok | Should -BeTrue
+    }
+
+    It 'GATE 2 no dispara si Copilot reporta filesModified' {
+        $r = New-Res @{ text = 'He creado el archivo.'; toolCalls = @(@{ name = 'bash'; success = $true }); filesModified = @('a.txt') }
+        (Test-ResponseVerification $r 'crea a.txt').ok | Should -BeTrue
+    }
+
+    It 'GATE 3: rechaza si todas las herramientas fallaron' {
+        $r = New-Res @{ toolCalls = @(@{ name = 'view'; success = $false }, @{ name = 'glob'; success = $false }); toolFailed = 2 }
+        $v = Test-ResponseVerification $r 'lista archivos'
+        $v.ok | Should -BeFalse
+        ($v.issues -join ' ') | Should -Match 'fallaron'
+    }
+
+    It 'acepta fallo parcial' {
+        $r = New-Res @{ toolCalls = @(@{ name = 'view'; success = $false }, @{ name = 'glob'; success = $true }); toolFailed = 1 }
+        (Test-ResponseVerification $r 'lista archivos').ok | Should -BeTrue
+    }
+
+    It 'rechaza respuesta vacia sin ejecucion' {
+        (Test-ResponseVerification (New-Res @{ text = '' }) 'hola').ok | Should -BeFalse
+    }
+}
+
+Describe 'Build-VerificationFeedback' {
+    It 'incluye la evidencia real y los problemas detectados' {
+        $r = @{ code = 0; text = 'listo'; toolCalls = @(@{ name = 'view'; success = $false }); toolFailed = 1; filesModified = @() }
+        $v = Test-ResponseVerification $r 'crea y edita el archivo x'
+        $fb = Build-VerificationFeedback $v $r
+        $fb | Should -Match 'VERIFICACION FALLIDA'
+        $fb | Should -Match 'Herramientas ejecutadas: 1'
+        $fb | Should -Match 'view -> FALLO'
+        $fb | Should -Match 'Archivos modificados: ninguno'
+        $fb | Should -Match 'No describas lo que harias'
+    }
+}
+
+Describe 'Invoke-AskPrompt (cableado de verificacion y reintento)' {
+    BeforeAll {
+        $script:Settings = @{ provider = 'copilot'; dir = ''; guard = 'off'; model = ''; mode = 'safe'; allowTools = 'view'; output = 'text' }
+        $script:Opts = @{ retry = $true; verify = $true; quiet = $true; resume = ''; noStream = $true }
+        function New-CopRes([hashtable]$o) {
+            $base = @{ code = 0; text = 'ok'; resume = 'sess-1'; toolCalls = [System.Collections.Generic.List[object]]::new(); toolFailed = 0; filesModified = @(); usage = @{}; streamed = $false }
+            foreach ($k in $o.Keys) { $base[$k] = $o[$k] }
+            return $base
+        }
+    }
+
+    It 'no reintenta cuando la verificacion pasa' {
+        $script:calls = 0
+        Mock Invoke-CopilotPrompt {
+            $script:calls++
+            $l = [System.Collections.Generic.List[object]]::new(); $l.Add(@{ name = 'view'; success = $true })
+            New-CopRes @{ toolCalls = $l }
+        }
+        $r = Invoke-AskPrompt 'lista los archivos' $script:Settings $script:Opts @{ retry = $true; verify = $true }
+        $script:calls | Should -Be 1
+        $r.verified | Should -BeTrue
+    }
+
+    It 'reintenta sobre la MISMA sesion cuando falla el gate' {
+        $script:calls = 0
+        $script:resumeUsed = $null
+        Mock Invoke-CopilotPrompt {
+            param($p, $s, $o, $sessionId, $resumeId)
+            $script:calls++
+            if ($script:calls -eq 1) { return New-CopRes @{ text = 'Ya revise todo, esta bien.' } }
+            $script:resumeUsed = $resumeId
+            $l = [System.Collections.Generic.List[object]]::new(); $l.Add(@{ name = 'powershell'; success = $true })
+            return New-CopRes @{ text = 'Hay 3 archivos.'; toolCalls = $l }
+        }
+        $r = Invoke-AskPrompt 'revisa los archivos del repo' $script:Settings $script:Opts @{ retry = $true; verify = $true }
+        $script:calls | Should -Be 2
+        # Critico: el reintento reusa la sesion (prompt cache) en vez de arrancar una nueva.
+        $script:resumeUsed | Should -Be 'sess-1'
+        $r.verified | Should -BeTrue
+    }
+
+    It 'acumula la evidencia de ambos turnos tras el reintento' {
+        $script:calls = 0
+        Mock Invoke-CopilotPrompt {
+            $script:calls++
+            $l = [System.Collections.Generic.List[object]]::new()
+            if ($script:calls -eq 1) { $l.Add(@{ name = 'view'; success = $false }); return New-CopRes @{ toolCalls = $l; toolFailed = 1 } }
+            $l.Add(@{ name = 'glob'; success = $true }); return New-CopRes @{ toolCalls = $l }
+        }
+        $r = Invoke-AskPrompt 'lista los archivos' $script:Settings $script:Opts @{ retry = $true; verify = $true }
+        @($r.toolCalls).Count | Should -Be 2
+    }
+
+    It '--no-verify desactiva el gate y no reintenta' {
+        $script:calls = 0
+        Mock Invoke-CopilotPrompt { $script:calls++; New-CopRes @{ text = 'Ya revise todo.' } }
+        $o = $script:Opts.Clone(); $o.verify = $false
+        $r = Invoke-AskPrompt 'revisa los archivos' $script:Settings $o @{ retry = $true; verify = $true }
+        $script:calls | Should -Be 1
+        $r.verified | Should -BeTrue
+    }
+
+    It 'marca verified=false si el reintento tampoco ejecuta nada' {
+        Mock Invoke-CopilotPrompt { New-CopRes @{ text = 'Ya revise todo.' } }
+        $r = Invoke-AskPrompt 'revisa los archivos' $script:Settings $script:Opts @{ retry = $true; verify = $true }
+        $r.verified | Should -BeFalse
+        Get-AskExitCode $r | Should -Be 3
+    }
+
+    It 'no reintenta si retry esta desactivado, pero sigue reportando el fallo' {
+        $script:calls = 0
+        Mock Invoke-CopilotPrompt { $script:calls++; New-CopRes @{ text = 'Ya revise todo.' } }
+        $o = $script:Opts.Clone(); $o.retry = $false
+        $r = Invoke-AskPrompt 'revisa los archivos' $script:Settings $o @{ retry = $true; verify = $true }
+        $script:calls | Should -Be 1
+        $r.verified | Should -BeFalse
+    }
+}
+
+Describe 'Get-AskExitCode' {
+    It 'propaga el exit code del provider' {
+        Get-AskExitCode @{ code = 2; verified = $true } | Should -Be 2
+    }
+    It 'devuelve 3 cuando la verificacion falla' {
+        Get-AskExitCode @{ code = 0; verified = $false } | Should -Be $script:ExitVerificationFailed
+    }
+    It 'devuelve 0 en exito verificado' {
+        Get-AskExitCode @{ code = 0; verified = $true } | Should -Be 0
     }
 }
 
 Describe 'ConvertTo-SingleLinePrompt' {
     It 'aplana saltos de linea para el shim cmd.exe' {
-        $p = Build-ExecutionFirstPrompt 'listar archivos'
+        $p = Build-ExecutionFirstPrompt 'listar archivos' @{ guard = 'always' }
         $flat = ConvertTo-SingleLinePrompt $p
         $flat | Should -Not -Match "`n"
         $flat | Should -Match 'INSTRUCCION OPERATIVA'

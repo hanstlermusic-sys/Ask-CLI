@@ -47,10 +47,51 @@ ask-cli "¿qué hace este repo?"
 | `sessions [list\|clear] [n]` | Lista o borra el historial local de sesiones. |
 | `model show\|set <id>` | Consulta o fija el modelo por defecto. |
 | `auth status\|login\|logout` | Delegado a Copilot CLI / `gh`. |
-| `doctor` | Diagnóstico de entorno, rutas y latencias. |
+| `doctor` | Diagnóstico de entorno, rutas, latencias y estado de verificación. |
 | `version` | Versión de ask-cli. |
+| `init-instructions [ruta]` | Escribe el guard de ejecución en `AGENTS.md` (idempotente). |
 | `project init\|show\|strict` | Perfiles por directorio. |
 | `config show\|set <k> <v>` | Configuración global. |
+
+## Verificación anti-alucinación
+
+El problema clásico de un wrapper sobre un LLM es que el modelo *diga* que hizo algo sin haberlo hecho.
+Intentar resolverlo pidiéndoselo por prompt no es verificable: `"Ya revisé los archivos"` supera cualquier
+filtro de texto sin haber ejecutado nada.
+
+`ask-cli` invoca siempre Copilot CLI con `--output-format json` y analiza el **JSONL de eventos**
+(`tool.execution_start`, `tool.execution_complete`, `result`). La decisión no se toma sobre la prosa,
+sino sobre la evidencia de ejecución:
+
+| Gate | Condición de fallo |
+|---|---|
+| 1. Ejecución | La tarea contiene un verbo accionable y se registraron **0** llamadas a herramientas. |
+| 2. Consistencia | El texto afirma haber creado/modificado algo, pero no hubo herramienta de escritura ni `codeChanges.filesModified`. |
+| 3. Sanidad | Todas las herramientas invocadas fallaron, o la respuesta está vacía sin ejecución. |
+
+Ante un fallo, `ask-cli` **reintenta sobre la misma sesión** (`--resume=<id>`) enviando la evidencia real
+como feedback. Reusar la sesión no es un detalle: mantiene el contexto y convierte los ~27 k tokens de
+`cache_write` de la primera llamada en `cache_read` en la segunda, en lugar de repagarlos.
+
+Si tras el reintento sigue sin verificar, el proceso termina con **exit code 3** y la lista de problemas.
+Se desactiva con `--no-verify` o `config set verify false`.
+
+```powershell
+ask-cli run "lista los .ps1 y cuenta sus lineas" --json
+# -> "verified": true, "tools": [{"name":"powershell","summary":"Get-ChildItem ...","success":true}]
+```
+
+### El guard: de tokens por llamada a instrucciones cacheadas
+
+Antes, el bloque de instrucciones operativas se anteponía a *cada* prompt. Con `init-instructions` pasa a
+vivir en `AGENTS.md`, que Copilot CLI carga automáticamente y cachea:
+
+```powershell
+ask-cli init-instructions .
+```
+
+Con `guard = auto` (por defecto), `ask-cli` detecta el marcador en `AGENTS.md` y deja de anteponerlo.
+`guard = always` fuerza el prepend; `guard = off` lo desactiva.
 
 ### Opciones
 
@@ -64,12 +105,15 @@ ask-cli "¿qué hace este repo?"
 | `--attach <ruta>` | Adjunto (repetible). |
 | `--resume <id>` | Reanuda una sesión. |
 | `--allow-tool <lista>` | Herramientas permitidas en modo `safe`. |
+| `--agent <nombre>` | Agente custom de Copilot CLI. |
+| `--max-credits <n>` | Límite de AI credits premium por sesión. |
 | `--timeout <seg>` | Timeout de red del provider `vertex`. |
 | `--json` | Salida JSON (desactiva streaming). |
 | `--quiet` | Sin mensajes accesorios. |
-| `--verbose` | Muestra telemetría (AI Credits, Tokens, Changes). |
+| `--verbose` | Muestra el razonamiento del modelo y telemetría detallada. |
 | `--no-stream` | Desactiva el streaming incremental. |
-| `--no-retry` | No reintenta ante respuestas no operativas. |
+| `--no-retry` | No reintenta ante verificación fallida. |
+| `--no-verify` | Desactiva la verificación determinista de ejecución. |
 | `--safe` / `--trusted` | Atajos de modo de permisos. |
 | `--force-profile-override` | Ignora un perfil estricto. |
 | `--` | Todo lo que siga se trata como prompt literal. |
@@ -102,7 +146,19 @@ Archivos en `~/.ask-cli/`:
 | `allowTools` | `view,glob,rg` | Herramientas del modo `safe`. |
 | `timeoutSec` | `180` | Timeout de red del provider `vertex`. |
 | `historyMax` | `2000` | Líneas conservadas al rotar el historial. |
-| `retry` | `true` | Reintento ante respuesta no operativa. |
+| `retry` | `true` | Reintento ante verificación fallida. |
+| `verify` | `true` | Gates de verificación determinista sobre el JSONL. |
+| `guard` | `auto` | `auto` (omite el guard si está en `AGENTS.md`), `always`, `off`. |
+| `agent` | `` | Agente custom de Copilot CLI. |
+| `maxCredits` | `0` | Límite de AI credits premium (0 = sin límite). |
+
+### Códigos de salida
+
+| Código | Significado |
+|---|---|
+| `0` | Éxito verificado. |
+| `1` | Error de uso o del provider. |
+| `3` | La respuesta no superó la verificación tras el reintento. |
 
 ## Perfiles por proyecto
 
@@ -127,7 +183,14 @@ Decisiones deliberadas en el hot path:
 - **Dos `Regex` compilados** en vez de once `-match` por línea (~10x en el filtrado).
 - **Cache de `copilotPath`** en `config.json`: la resolución baja de ~100 ms a ~8 ms por invocación.
 - **Historial acotado**: `Get-Content -Tail` para leer y rotación por tamaño (2 MB) para escribir.
-- **Reintento acotado**: solo se reintenta si la respuesta es corta (< 400 caracteres) y coincide con las heurísticas.
+- **Reintento acotado**: solo se reintenta si la verificación falla, y siempre sobre la misma sesión.
+- **Sesión fijada por adelantado** (`--session-id <uuid>`): permite reintentar con `--resume` reusando el
+  prompt cache. Una corrida real de referencia escribe ~27,5 k tokens de caché; el reintento antiguo
+  arrancaba sesión nueva y los repagaba, el actual los lee.
+- **Guard fuera del hot path**: con `init-instructions`, el bloque de instrucciones deja de enviarse en cada
+  prompt y pasa a `AGENTS.md`, que Copilot cachea.
+- **Sin doble parseo**: el JSONL se consume en un solo `ForEach-Object` que streamea, acumula texto,
+  registra herramientas y extrae telemetría en la misma pasada.
 
 ### Correcciones relevantes
 
@@ -141,11 +204,24 @@ se encuentra, se cae al shim y el prompt se aplana con `ConvertTo-SingleLineProm
 **Filtro de ruido incompleto.** Las líneas `    + CategoryInfo` / `    + FullyQualifiedErrorId` que emite
 PowerShell llevan prefijo `+ `, por lo que el filtro original nunca las capturaba y se colaban en la salida.
 
+**Script sin BOM interpretado como ANSI.** PowerShell 5.1 asume ANSI para un `.ps1` sin BOM. El archivo estaba
+en UTF-8 sin BOM, así que en runtime `cre[eé]` se cargaba como `cre[eÃ©]`: los patrones con acentos **nunca
+matcheaban**, degradando en silencio el gate de consistencia y el filtro de errores en español. Se añadió el
+BOM UTF-8 y un test de regresión que lo verifica.
+
+**Flags con valor opcional.** `--resume` y `--allow-tool` declaran su valor como opcional en Copilot CLI, por lo
+que `--resume abc` no enlaza (`abc` se interpreta como argumento posicional). Ahora se emiten como
+`--resume=abc` y `--allow-tool=view,glob,rg`.
+
 ### Limitaciones conocidas
 
 - `timeoutSec` aplica al provider `vertex`. El provider `copilot` hereda el comportamiento de Copilot CLI
   (sin timeout forzado desde el wrapper).
 - El chat interactivo continuo no está disponible para `--provider vertex`.
+- La verificación solo cubre el provider `copilot`: `vertex` no expone telemetría de herramientas y se reporta
+  siempre como verificado.
+- Los gates usan heurística léxica para decidir si una tarea es *accionable*. Puede haber falsos positivos
+  (una pregunta redactada como orden) que provoquen un reintento innecesario; `--no-verify` lo desactiva.
 - Windows-first: se resuelve `copilot.cmd` y se usan rutas con `\`.
 
 ## Desarrollo

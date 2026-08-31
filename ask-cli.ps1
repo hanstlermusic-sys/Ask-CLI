@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 param(
   [Parameter(ValueFromRemainingArguments = $true)]
   [string[]]$Args
@@ -12,12 +12,34 @@ $ConfigPath = Join-Path $AskHome 'config.json'
 $HistoryPath = Join-Path $AskHome 'history.jsonl'
 $ProfilesPath = Join-Path $AskHome 'project-profiles.json'
 
-$script:AskCliVersion = '0.3.0'
+$script:AskCliVersion = '0.4.0'
 $script:ResolvedCopilot = ''
 $script:Invoker = $null
 $script:Cfg = $null
 
+# Marcador idempotente del bloque que ask-cli inyecta en AGENTS.md.
+$script:GuardMarker = '<!-- ask-cli:execution-first -->'
+
+# Codigo de salida reservado para "el modelo no verifico su trabajo".
+$script:ExitVerificationFailed = 3
+
 $RxCompiled = [System.Text.RegularExpressions.RegexOptions]::Compiled
+$RxCompiledIC = [System.Text.RegularExpressions.RegexOptions]::Compiled -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+
+# Verbos que implican trabajo real sobre el sistema: si aparecen, exigimos evidencia de herramientas.
+$script:ActionVerbRegex = [regex]::new(
+  '\b(?:list[ae]|lista|enumera|valida|verifica|revisa|comprueba|diagnostica|analiza|audita|busca|encuentra|cuenta|ejecuta|corre|crea|genera|modifica|actualiza|arregla|corrige|implementa|refactoriza|escribe|borra|elimina|instala|prueba|testea|compila|lee|abre|inspecciona|list|check|verify|validate|review|inspect|analyze|audit|search|find|count|run|execute|create|generate|update|modify|fix|implement|refactor|write|delete|remove|install|test|build|compile|read|open)\w*\b',
+  $RxCompiledIC)
+
+# Afirmaciones de escritura: si el modelo dice esto sin escrituras registradas, alucino.
+$script:ClaimedWriteRegex = [regex]::new(
+  '\b(?:cre[eé]|cre[eé]e|creado|creada|modifiqu[eé]|modificado|modificada|actualic[eé]|actualizado|actualizada|escrib[ií]|escrito|guard[eé]|guardado|a[nñ]ad[ií]|agregu[eé]|agregado|elimin[eé]|borr[eé]|borrado|renombr[eé]|parche[eé]|apliqu[eé] el parche|created|updated|modified|wrote|written|added|removed|deleted|renamed|patched|saved)\b',
+  $RxCompiledIC)
+
+# Herramientas capaces de mutar el disco (incluye shells: pueden escribir sin que Copilot lo contabilice).
+$script:WriteToolRegex = [regex]::new(
+  '^(?:write|edit|create|replace|insert|str_replace|apply_patch|multi_edit|notebook_edit|save|delete|remove|move|rename|mkdir|bash|sh|shell|powershell|pwsh|cmd|terminal|run_command|execute_command)(?:[_-]\w+)*$',
+  $RxCompiledIC)
 
 # Ruido de PowerShell/Node que nunca aporta nada al usuario: se descarta siempre.
 # Nota: PowerShell emite CategoryInfo/FullyQualifiedErrorId con prefijo "    + ", de ahi el \+? opcional.
@@ -69,10 +91,23 @@ function Default-Config {
     lastVertexConvId = ''
     copilotPath = ''      # cache de la ruta resuelta de copilot.cmd
     allowTools = 'view,glob,rg'
+    agent = ''
     timeoutSec = 180
     historyMax = 2000
+    maxCredits = 0
     retry = $true
+    verify = $true
+    guard = 'auto'   # auto|always|off
   }
+}
+
+# Acceso a propiedades de JSON tolerante a Set-StrictMode.
+function Get-Prop($obj, [string]$name) {
+  if ($null -eq $obj) { return $null }
+  if (-not $obj.PSObject) { return $null }
+  $p = $obj.PSObject.Properties[$name]
+  if ($null -eq $p) { return $null }
+  return $p.Value
 }
 
 function Load-Config {
@@ -195,6 +230,10 @@ function Resolve-Settings($cfg, [hashtable]$opts) {
   if (-not $out.allowTools) { $out.allowTools = 'view,glob,rg' }
   $out.timeoutSec = if ((ConvertTo-IntValue $opts.timeoutSec 0) -gt 0) { ConvertTo-IntValue $opts.timeoutSec 180 } else { ConvertTo-IntValue $cfg.timeoutSec 180 }
   if ($out.timeoutSec -le 0) { $out.timeoutSec = 180 }
+  $out.agent = if ($opts.agent) { [string]$opts.agent } elseif ($profile -and $profile.agent) { [string]$profile.agent } else { [string]$cfg.agent }
+  $out.maxCredits = if ((ConvertTo-IntValue $opts.maxCredits 0) -gt 0) { ConvertTo-IntValue $opts.maxCredits 0 } else { ConvertTo-IntValue $cfg.maxCredits 0 }
+  $out.guard = if ($profile -and $profile.guard) { [string]$profile.guard } else { [string]$cfg.guard }
+  if (-not $out.guard) { $out.guard = 'auto' }
   return $out
 }
 
@@ -293,9 +332,8 @@ function ConvertTo-SingleLinePrompt([string]$text) {
   return ((([string]$text) -replace "`r`n", "`n") -replace "`n+", ' | ').Trim()
 }
 
-function Build-ExecutionFirstPrompt([string]$prompt) {
-  $guard = @'
-INSTRUCCION OPERATIVA:
+function Get-GuardText {
+  return @'
 - Ejecuta herramientas/comandos cuando el usuario pida listar, validar, revisar, comprobar o diagnosticar algo.
 - No respondas solo con recomendaciones si la tarea requiere datos reales del sistema o archivos.
 - Si un intento falla por permisos, prueba una alternativa de lectura/consulta no destructiva y reporta resultado real.
@@ -303,8 +341,34 @@ INSTRUCCION OPERATIVA:
 - FLUIDEZ: avanza de corrido hasta completar la tarea; no te detengas para pedir pasos intermedios.
 - Si faltan detalles menores, asume la opción razonable y continúa.
 - Solo haz preguntas si falta un dato crítico imposible de inferir o si la acción es destructiva/irreversible.
+- No afirmes haber leído, ejecutado o modificado algo que no ejecutaste realmente con una herramienta.
 '@
-  return ($guard + "`n`nTAREA:`n" + $prompt)
+}
+
+function Get-AgentsFilePath([string]$dir) {
+  $target = if ($dir) { $dir } else { (Get-Location).Path }
+  return (Join-Path (Resolve-FullPath $target) 'AGENTS.md')
+}
+
+# Si el guard ya vive en AGENTS.md, Copilot lo carga como instruccion cacheada
+# y anteponerlo en cada prompt seria pagar los mismos tokens dos veces.
+function Test-HasPersistentGuard([string]$dir) {
+  try {
+    $p = Get-AgentsFilePath $dir
+    if (-not (Test-Path $p)) { return $false }
+    return ((Get-Content $p -Raw -ErrorAction SilentlyContinue) -like ('*' + $script:GuardMarker + '*'))
+  } catch { return $false }
+}
+
+function Build-ExecutionFirstPrompt([string]$prompt, [hashtable]$settings) {
+  $mode = 'auto'
+  if ($settings -and $settings.ContainsKey('guard') -and $settings.guard) { $mode = [string]$settings.guard }
+  if ($mode -eq 'off') { return $prompt }
+  if ($mode -eq 'auto') {
+    $dir = if ($settings) { [string]$settings.dir } else { '' }
+    if (Test-HasPersistentGuard $dir) { return $prompt }
+  }
+  return ("INSTRUCCION OPERATIVA:`n" + (Get-GuardText) + "`n`nTAREA:`n" + $prompt)
 }
 
 function Is-NonOperationalCopilotReply([string]$text) {
@@ -350,56 +414,209 @@ function Get-LastResume {
   return ''
 }
 
-function Invoke-CopilotPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opts) {
+function Get-ToolSummary($data) {
+  $a = Get-Prop $data 'arguments'
+  if ($null -eq $a) { return '' }
+  foreach ($k in @('command', 'pattern', 'path', 'filePath', 'file_path', 'query', 'url', 'description')) {
+    $v = Get-Prop $a $k
+    if ($v) {
+      $s = ([string]$v) -replace '\s+', ' '
+      if ($s.Length -gt 90) { $s = $s.Substring(0, 90) + '...' }
+      return $s
+    }
+  }
+  return ''
+}
+
+function Test-IsActionableTask([string]$prompt) {
+  return $script:ActionVerbRegex.IsMatch([string]$prompt)
+}
+
+function Test-HasWriteTool($toolCalls) {
+  foreach ($t in $toolCalls) {
+    if ($script:WriteToolRegex.IsMatch([string]$t.name)) { return $true }
+  }
+  return $false
+}
+
+# Verificacion determinista: no juzga el estilo de la prosa, sino la evidencia
+# de ejecucion que Copilot CLI emite en el JSONL.
+function Test-ResponseVerification([hashtable]$res, [string]$prompt) {
+  $issues = [System.Collections.Generic.List[string]]::new()
+  $actionable = Test-IsActionableTask $prompt
+  $toolCount = @($res.toolCalls).Count
+  $text = [string]$res.text
+
+  if ($actionable -and $toolCount -eq 0) {
+    $issues.Add('La tarea pedia accion pero no se ejecuto ninguna herramienta (0 llamadas registradas).')
+  }
+  if ($toolCount -gt 0 -and $res.toolFailed -eq $toolCount) {
+    $issues.Add("Todas las llamadas a herramientas fallaron ($($res.toolFailed)/$toolCount).")
+  }
+  if ($script:ClaimedWriteRegex.IsMatch($text) -and
+      @($res.filesModified).Count -eq 0 -and
+      -not (Test-HasWriteTool $res.toolCalls)) {
+    $issues.Add('La respuesta afirma haber creado o modificado algo, pero no hay ninguna escritura registrada.')
+  }
+  if (-not $text.Trim() -and $toolCount -eq 0) {
+    $issues.Add('Respuesta vacia y sin ejecucion.')
+  }
+
+  return @{ ok = ($issues.Count -eq 0); issues = $issues; actionable = $actionable }
+}
+
+function Build-VerificationFeedback([hashtable]$verification, [hashtable]$res) {
+  $sb = New-Object System.Text.StringBuilder
+  [void]$sb.AppendLine('VERIFICACION FALLIDA. Esto es lo que quedo registrado de tu turno anterior:')
+  [void]$sb.AppendLine(('- Herramientas ejecutadas: ' + @($res.toolCalls).Count))
+  foreach ($t in $res.toolCalls) {
+    [void]$sb.AppendLine(('  * ' + $t.name + ' -> ' + $(if ($t.success -eq $false) { 'FALLO' } else { 'ok' })))
+  }
+  [void]$sb.AppendLine(('- Archivos modificados: ' + $(if (@($res.filesModified).Count -gt 0) { ($res.filesModified -join ', ') } else { 'ninguno' })))
+  [void]$sb.AppendLine('')
+  [void]$sb.AppendLine('Problemas detectados:')
+  foreach ($i in $verification.issues) { [void]$sb.AppendLine(('- ' + $i)) }
+  [void]$sb.AppendLine('')
+  [void]$sb.AppendLine('Ejecuta ahora las herramientas necesarias y responde con los resultados reales obtenidos.')
+  [void]$sb.Append('No describas lo que harias: hazlo.')
+  return $sb.ToString()
+}
+
+function Invoke-CopilotPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opts, [string]$sessionId, [string]$resumeId) {
   $inv = Get-CopilotInvoker
   $exe = [string]$inv.exe
   $cargs = @() + $inv.prefix
   if ($settings.dir) { $cargs += @('-C', $settings.dir) }
   if ($settings.model) { $cargs += @('--model', $settings.model) }
-  if ($opts.resume) { $cargs += @('--resume', $opts.resume) }
+  if ($settings.agent) { $cargs += @('--agent', [string]$settings.agent) }
+  # --resume y --allow-tool declaran valor OPCIONAL en Copilot CLI: solo enlazan con la forma "=".
+  if ($resumeId) { $cargs += ("--resume=" + $resumeId) }
+  elseif ($sessionId) { $cargs += @('--session-id', $sessionId) }
   foreach ($a in $opts.attachments) { $cargs += @('--attachment', [string]$a) }
   foreach ($d in $opts.addDirs) { $cargs += @('--add-dir', [string]$d) }
   if ($settings.mode -eq 'trusted') {
     $cargs += '--allow-all-tools'
   } else {
-    $cargs += @('--allow-tool', [string]$settings.allowTools)
+    $cargs += ('--allow-tool=' + [string]$settings.allowTools)
   }
-  if ($settings.output -eq 'json') { $cargs += @('--output-format', 'json') }
+  $maxCredits = ConvertTo-IntValue $settings.maxCredits 0
+  if ($maxCredits -gt 0) { $cargs += @('--max-ai-credits', [string]$maxCredits) }
+
+  $usageFile = Join-Path ([System.IO.Path]::GetTempPath()) ("askcli-usage-" + [Guid]::NewGuid().ToString() + ".json")
+  $cargs += @('--usage-output-file', $usageFile)
+  # Siempre pedimos JSONL: es la unica forma de saber que se ejecuto de verdad.
+  $cargs += @('--no-color', '--output-format', 'json')
   foreach ($p in $opts.passthrough) { $cargs += [string]$p }
   $finalPrompt = if ($inv.multiline) { $prompt } else { ConvertTo-SingleLinePrompt $prompt }
   $cargs += @('--prompt', $finalPrompt)
 
   $rawLines = [System.Collections.Generic.List[string]]::new()
-  $filtered = [System.Collections.Generic.List[string]]::new()
+  $toolCalls = [System.Collections.Generic.List[object]]::new()
+  $textSb = New-Object System.Text.StringBuilder
+  # Hashtable compartida: las asignaciones directas no cruzan el scope de ForEach-Object.
+  $meta = @{ sessionId = ''; exitCode = $null; failed = 0; filesModified = @(); premium = 0; apiMs = 0; sessionMs = 0; linesAdded = 0; linesRemoved = 0; model = '' }
   $verbose = [bool]$opts.verbose
   $stream = ($settings.output -ne 'json') -and (-not $opts.noStream)
 
-  # Streaming real: cada linea se filtra e imprime conforme el proceso la emite.
   & $exe @cargs 2>&1 | ForEach-Object {
     $line = [string]$_
     $rawLines.Add($line)
-    if ($script:NoiseRegex.IsMatch($line)) { return }
-    if ((-not $verbose) -and $script:TelemetryRegex.IsMatch($line)) { return }
-    $filtered.Add($line)
-    if ($stream) { Write-Host $line }
-  }
-  $exitCode = $LASTEXITCODE
-  if ($null -eq $exitCode) { $exitCode = 0 }
+    if (-not $line.StartsWith('{')) {
+      if ($verbose -and -not $script:NoiseRegex.IsMatch($line) -and $line.Trim()) { Write-Host $line }
+      return
+    }
+    $ev = $null
+    try { $ev = $line | ConvertFrom-Json } catch { return }
+    $etype = [string](Get-Prop $ev 'type')
+    $data = Get-Prop $ev 'data'
 
-  $resume = ''
-  foreach ($l in $rawLines) {
-    $m = $script:ResumeRegex.Match($l)
-    if ($m.Success) { $resume = $m.Groups[1].Value }
+    switch ($etype) {
+      'assistant.message_delta' {
+        $d = [string](Get-Prop $data 'deltaContent')
+        if ($d) {
+          [void]$textSb.Append($d)
+          if ($stream) { Write-Host -NoNewline $d }
+        }
+      }
+      'assistant.reasoning_delta' {
+        if ($stream -and $verbose) {
+          $d = [string](Get-Prop $data 'deltaContent')
+          if ($d) { Write-Host -NoNewline $d -ForegroundColor DarkGray }
+        }
+      }
+      'tool.execution_start' {
+        $entry = @{
+          id = [string](Get-Prop $data 'toolCallId')
+          name = [string](Get-Prop $data 'toolName')
+          summary = (Get-ToolSummary $data)
+          success = $null
+        }
+        $toolCalls.Add($entry)
+        if ($stream) {
+          Write-Host ''
+          Write-Host ('  > ' + $entry.name + $(if ($entry.summary) { ': ' + $entry.summary } else { '' })) -ForegroundColor DarkCyan
+        }
+      }
+      'tool.execution_complete' {
+        $id = [string](Get-Prop $data 'toolCallId')
+        $ok = Get-Prop $data 'success'
+        $okBool = ($null -eq $ok) -or [bool]$ok
+        foreach ($t in $toolCalls) { if ($t.id -eq $id) { $t.success = $okBool } }
+        if (-not $okBool) {
+          $meta.failed = $meta.failed + 1
+          if ($stream) { Write-Host '    (fallo)' -ForegroundColor DarkYellow }
+        }
+      }
+      'result' {
+        $meta.sessionId = [string](Get-Prop $ev 'sessionId')
+        $ec = Get-Prop $ev 'exitCode'
+        if ($null -ne $ec) { $meta.exitCode = [int]$ec }
+        $u = Get-Prop $ev 'usage'
+        if ($u) {
+          $meta.premium = ConvertTo-IntValue (Get-Prop $u 'premiumRequests') 0
+          $meta.apiMs = ConvertTo-IntValue (Get-Prop $u 'totalApiDurationMs') 0
+          $meta.sessionMs = ConvertTo-IntValue (Get-Prop $u 'sessionDurationMs') 0
+          $cc = Get-Prop $u 'codeChanges'
+          if ($cc) {
+            $meta.linesAdded = ConvertTo-IntValue (Get-Prop $cc 'linesAdded') 0
+            $meta.linesRemoved = ConvertTo-IntValue (Get-Prop $cc 'linesRemoved') 0
+            $fm = Get-Prop $cc 'filesModified'
+            if ($fm) { $meta.filesModified = @($fm) }
+          }
+        }
+      }
+    }
   }
+  $nativeExit = $LASTEXITCODE
+  if ($stream -and $textSb.Length -gt 0) { Write-Host '' }
 
-  $text = (($filtered -join [Environment]::NewLine)).Trim()
+  try {
+    if (Test-Path $usageFile) {
+      $usageObj = (Get-Content $usageFile -Raw) | ConvertFrom-Json
+      $meta.model = [string](Get-Prop $usageObj 'currentModel')
+      Remove-Item $usageFile -Force -ErrorAction SilentlyContinue
+    }
+  } catch {}
+
+  $exitCode = if ($null -ne $meta.exitCode) { $meta.exitCode } elseif ($null -ne $nativeExit) { $nativeExit } else { 0 }
+
   return @{
     code = $exitCode
-    text = $text
-    resume = $resume
-    route = ''
+    text = $textSb.ToString().Trim()
+    resume = $(if ($meta.sessionId) { $meta.sessionId } else { $sessionId })
+    route = $meta.model
     raw = ($rawLines -join [Environment]::NewLine)
-    streamed = ($stream -and $filtered.Count -gt 0)
+    streamed = ($stream -and $textSb.Length -gt 0)
+    toolCalls = $toolCalls
+    toolFailed = $meta.failed
+    filesModified = $meta.filesModified
+    usage = @{
+      premiumRequests = $meta.premium
+      apiMs = $meta.apiMs
+      sessionMs = $meta.sessionMs
+      linesAdded = $meta.linesAdded
+      linesRemoved = $meta.linesRemoved
+    }
   }
 }
 
@@ -498,28 +715,61 @@ function Invoke-VertexPrompt([string]$prompt, [hashtable]$settings, [hashtable]$
 }
 
 function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opts, [hashtable]$cfg) {
-  $effective = Build-ExecutionFirstPrompt $prompt
-  $res = if ($settings.provider -eq 'vertex') {
-    Invoke-VertexPrompt $effective $settings $opts $cfg
-  } else {
-    Invoke-CopilotPrompt $effective $settings $opts
+  $isVertex = ($settings.provider -eq 'vertex')
+  $effective = Build-ExecutionFirstPrompt $prompt $settings
+
+  if ($isVertex) {
+    $res = Invoke-VertexPrompt $effective $settings $opts $cfg
+    if ((ConvertTo-BoolValue $opts.retry $true) -and (ConvertTo-BoolValue $cfg.retry $true) -and
+        ($res.code -eq 0) -and (Is-NonOperationalCopilotReply $res.text)) {
+      $res = Invoke-VertexPrompt ($effective + "`n`nREINTENTO OBLIGATORIO: ejecuta la tarea ahora, no pidas más datos intermedios.") $settings $opts $cfg
+    }
+    if ($res.resume) { $cfg.lastVertexConvId = $res.resume }
+    # Vertex no expone telemetria de herramientas: normalizamos al mismo envelope.
+    $res.toolCalls = New-Object System.Collections.Generic.List[object]
+    $res.toolFailed = 0
+    $res.filesModified = @()
+    $res.usage = @{ premiumRequests = 0; apiMs = 0; sessionMs = 0; linesAdded = 0; linesRemoved = 0 }
+    $res.verified = $true
+    $res.issues = @()
+    return $res
   }
 
-  $wantRetry = ConvertTo-BoolValue $opts.retry $true
-  if ($wantRetry) { $wantRetry = ConvertTo-BoolValue $cfg.retry $true }
-  if ($wantRetry -and ($res.code -eq 0) -and (Is-NonOperationalCopilotReply $res.text)) {
-    $retryPrompt = $effective + "`n`nREINTENTO OBLIGATORIO: ejecuta la tarea ahora, no pidas más datos intermedios."
-    if ($res.streamed -eq $true -and -not $opts.quiet) { Write-Host "[ask-cli] respuesta no operativa, reintentando..." }
-    $res = if ($settings.provider -eq 'vertex') {
-      Invoke-VertexPrompt $retryPrompt $settings $opts $cfg
-    } else {
-      Invoke-CopilotPrompt $retryPrompt $settings $opts
+  # Fijamos el UUID de sesion por adelantado: el reintento reusa la misma sesion
+  # (conserva contexto y aprovecha el prompt cache en vez de repagarlo).
+  $sessionId = if ($opts.resume) { '' } else { [Guid]::NewGuid().ToString() }
+  $resumeId = [string]$opts.resume
+
+  $res = Invoke-CopilotPrompt $effective $settings $opts $sessionId $resumeId
+
+  $wantVerify = (ConvertTo-BoolValue $opts.verify $true) -and (ConvertTo-BoolValue $cfg.verify $true)
+  $wantRetry = (ConvertTo-BoolValue $opts.retry $true) -and (ConvertTo-BoolValue $cfg.retry $true)
+  $verification = @{ ok = $true; issues = @(); actionable = $false }
+
+  if ($wantVerify -and $res.code -eq 0) {
+    $verification = Test-ResponseVerification $res $prompt
+    if ((-not $verification.ok) -and $wantRetry -and $res.resume) {
+      if (-not $opts.quiet) {
+        Write-Host ''
+        Write-Host '[ask-cli] verificacion fallida, reintentando con evidencia:' -ForegroundColor Yellow
+        foreach ($i in $verification.issues) { Write-Host ('  - ' + $i) -ForegroundColor Yellow }
+      }
+      $feedback = Build-VerificationFeedback $verification $res
+      $retryRes = Invoke-CopilotPrompt $feedback $settings $opts '' $res.resume
+      if ($retryRes.code -eq 0) {
+        # El reintento continua la misma sesion: acumulamos la evidencia de ambos turnos.
+        foreach ($t in $res.toolCalls) { $retryRes.toolCalls.Add($t) }
+        $retryRes.toolFailed = $retryRes.toolFailed + $res.toolFailed
+        if (@($retryRes.filesModified).Count -eq 0) { $retryRes.filesModified = $res.filesModified }
+        $res = $retryRes
+        $verification = Test-ResponseVerification $res $prompt
+      }
     }
   }
 
-  if ($res.resume) {
-    if ($settings.provider -eq 'vertex') { $cfg.lastVertexConvId = $res.resume } else { $cfg.lastResume = $res.resume }
-  }
+  $res.verified = [bool]$verification.ok
+  $res.issues = @($verification.issues)
+  if ($res.resume) { $cfg.lastResume = $res.resume }
   return $res
 }
 
@@ -537,6 +787,7 @@ Uso:
   ask-cli auth status|login|logout
   ask-cli doctor
   ask-cli version
+  ask-cli init-instructions [ruta]
   ask-cli project init [ruta] [--provider ...] [--model ...] [--strict-profile|--relaxed-profile]
   ask-cli project show [ruta]
   ask-cli project strict on|off [ruta]
@@ -552,23 +803,35 @@ Opciones:
   --attach <ruta>             Adjunto (repetible).
   --resume <id>               Reanuda sesion.
   --allow-tool <lista>        Herramientas permitidas en modo safe.
+  --agent <nombre>            Agente custom de Copilot CLI.
+  --max-credits <n>           Limite de AI credits premium por sesion.
   --timeout <seg>             Timeout de red del provider vertex.
   --json                      Salida JSON (desactiva streaming).
   --quiet                     Sin mensajes accesorios.
-  --verbose                   Muestra telemetria (AI Credits, Tokens, Changes).
+  --verbose                   Muestra razonamiento y telemetria detallada.
   --no-stream                 Desactiva streaming incremental.
-  --no-retry                  No reintenta ante respuesta no operativa.
+  --no-retry                  No reintenta ante verificacion fallida.
+  --no-verify                 Desactiva la verificacion determinista de ejecucion.
   --safe | --trusted          Atajos de modo.
   --force-profile-override    Ignora un perfil estricto.
   --                          Todo lo que siga es prompt literal.
+
+Verificacion anti-alucinacion:
+  Se analiza el JSONL de Copilot CLI (--output-format json) en vez de adivinar sobre la prosa:
+    1. Tarea accionable sin ninguna herramienta ejecutada  -> fallo
+    2. Afirma haber escrito/creado archivos pero no hubo write-tool ni codeChanges -> fallo
+    3. Toda herramienta ejecutada fallo -> fallo
+  Ante fallo se reintenta sobre la MISMA sesion (--resume) reusando el prompt cache.
+  Exit code 3 si sigue sin verificar. Usa --no-verify para desactivarlo.
 
 Notas:
   - Modo trusted: usa --allow-all-tools. Modo safe: limita a --allow-tool (default view,glob,rg).
   - Flags --* no reconocidos se reenvian tal cual a Copilot CLI (passthrough), p.ej. MCP.
   - Provider vertex usa HanstlerS local API en http://127.0.0.1:8717/api/chat.
   - Perfil estricto bloquea provider/model/mode/dir del proyecto; usa --force-profile-override.
+  - `init-instructions` mueve el guard a AGENTS.md (cacheado por Copilot) y ahorra tokens por llamada.
   - Claves de config: provider, model, vertexModel, mode, dir, output, copilotPath,
-    allowTools, timeoutSec, historyMax, retry.
+    allowTools, timeoutSec, historyMax, retry, verify, guard, agent, maxCredits.
 '@ | Write-Host
 }
 
@@ -585,11 +848,14 @@ function Parse-Options([string[]]$tokens) {
     addDirs = @()
     passthrough = @()
     allowTools = ''
+    agent = ''
+    maxCredits = 0
     timeoutSec = 0
     quiet = $false
     noStream = $false
     verbose = $false
     retry = $true
+    verify = $true
     forceProfileOverride = $false
     strictProfile = ''
     prompt = @()
@@ -607,6 +873,8 @@ function Parse-Options([string[]]$tokens) {
       '--attach'   { $i++; if ($i -lt $tokens.Count) { $opts.attachments += [string]$tokens[$i] } }
       '--add-dir'  { $i++; if ($i -lt $tokens.Count) { $opts.addDirs += [string]$tokens[$i] } }
       '--allow-tool' { $i++; if ($i -lt $tokens.Count) { $opts.allowTools = [string]$tokens[$i] } }
+      '--agent'    { $i++; if ($i -lt $tokens.Count) { $opts.agent = [string]$tokens[$i] } }
+      '--max-credits' { $i++; if ($i -lt $tokens.Count) { $opts.maxCredits = ConvertTo-IntValue $tokens[$i] 0 } }
       '--timeout'  { $i++; if ($i -lt $tokens.Count) { $opts.timeoutSec = ConvertTo-IntValue $tokens[$i] 0 } }
       '--json'     { $opts.output = 'json' }
       '--quiet'    { $opts.quiet = $true }
@@ -614,6 +882,8 @@ function Parse-Options([string[]]$tokens) {
       '--no-stream' { $opts.noStream = $true }
       '--no-retry' { $opts.retry = $false }
       '--retry'    { $opts.retry = $true }
+      '--no-verify' { $opts.verify = $false }
+      '--verify'   { $opts.verify = $true }
       '--safe'     { $opts.mode = 'safe' }
       '--trusted'  { $opts.mode = 'trusted' }
       '--force-profile-override' { $opts.forceProfileOverride = $true }
@@ -641,6 +911,50 @@ function Parse-Options([string[]]$tokens) {
   return $opts
 }
 
+function Write-AskResult([hashtable]$res, [hashtable]$settings, [hashtable]$opts) {
+  if ($settings.output -eq 'json') {
+    $tools = @()
+    foreach ($t in $res.toolCalls) { $tools += @{ name = $t.name; summary = $t.summary; success = $t.success } }
+    @{
+      ok = ($res.code -eq 0 -and $res.verified)
+      provider = $settings.provider
+      resume = $res.resume
+      route = [string]$res['route']
+      verified = $res.verified
+      issues = @($res.issues)
+      tools = $tools
+      filesModified = @($res.filesModified)
+      usage = $res['usage']
+      text = $res.text
+    } | ConvertTo-Json -Depth 8
+    return
+  }
+
+  if ($res.text -and -not ($res['streamed'] -eq $true)) { $res.text | Write-Host }
+  if ($opts.quiet) { return }
+
+  $toolCount = @($res.toolCalls).Count
+  if ($toolCount -gt 0 -or @($res.filesModified).Count -gt 0) {
+    $parts = @("$toolCount herramienta(s)")
+    if ($res.toolFailed -gt 0) { $parts += "$($res.toolFailed) fallida(s)" }
+    if (@($res.filesModified).Count -gt 0) { $parts += "$(@($res.filesModified).Count) archivo(s) modificado(s)" }
+    $u = $res['usage']
+    if ($u -and $u.premiumRequests -gt 0) { $parts += "$($u.premiumRequests) premium request(s)" }
+    Write-Host ('[ask-cli] ' + ($parts -join ' | ')) -ForegroundColor DarkGray
+  }
+  if (-not $res.verified) {
+    Write-Host '[ask-cli] SIN VERIFICAR:' -ForegroundColor Red
+    foreach ($i in $res.issues) { Write-Host ('  - ' + $i) -ForegroundColor Red }
+  }
+  if ($res.resume) { Write-Host ("resume: " + $res.resume) -ForegroundColor DarkGray }
+}
+
+function Get-AskExitCode([hashtable]$res) {
+  if ($res.code -ne 0) { return $res.code }
+  if (-not $res.verified) { return $script:ExitVerificationFailed }
+  return 0
+}
+
 if ($env:ASKCLI_NO_MAIN -eq '1') { return }
 
 if (-not $Args -or $Args.Count -eq 0) {
@@ -653,7 +967,7 @@ $script:Cfg = $cfg
 $cmd = [string]$Args[0]
 
 # Backward compatibility: ask-cli "pregunta"
-if ($cmd -notin @('run','chat','resume','sessions','model','auth','doctor','project','config','help','version','--version','-v')) {
+if ($cmd -notin @('run','chat','resume','sessions','model','auth','doctor','project','config','help','version','--version','-v','init-instructions')) {
   $opts = Parse-Options @($Args)
   $settings = Resolve-Settings $cfg $opts
   try {
@@ -674,13 +988,11 @@ if ($cmd -notin @('run','chat','resume','sessions','model','auth','doctor','proj
     prompt = $prompt
     resume = $res.resume
     code = $res.code
+    tools = @($res.toolCalls).Count
+    verified = $res.verified
   }
-  if ($settings.output -eq 'json') {
-    @{ ok = ($res.code -eq 0); provider = $settings.provider; resume = $res.resume; text = $res.text } | ConvertTo-Json -Depth 6
-  } else {
-    if ($res.text -and -not ($res['streamed'] -eq $true)) { $res.text | Write-Host }
-  }
-  exit $res.code
+  Write-AskResult $res $settings $opts
+  exit (Get-AskExitCode $res)
 }
 
 switch ($cmd) {
@@ -713,15 +1025,11 @@ switch ($cmd) {
       prompt = $prompt
       resume = $res.resume
       code = $res.code
+      tools = @($res.toolCalls).Count
+      verified = $res.verified
     }
-    if ($settings.output -eq 'json') {
-      $routeVal = if ($null -ne $res['route']) { [string]$res['route'] } else { '' }
-      @{ ok = ($res.code -eq 0); provider = $settings.provider; resume = $res.resume; route = $routeVal; text = $res.text } | ConvertTo-Json -Depth 6
-    } else {
-      if ($res.text -and -not ($res['streamed'] -eq $true)) { $res.text | Write-Host }
-      if (-not $opts.quiet -and $res.resume) { Write-Host ("resume: " + $res.resume) }
-    }
-    exit $res.code
+    Write-AskResult $res $settings $opts
+    exit (Get-AskExitCode $res)
   }
   'chat' {
     $opts = Parse-Options @($Args[1..($Args.Count-1)])
@@ -747,6 +1055,29 @@ switch ($cmd) {
     foreach ($p in $opts.passthrough) { $cpArgs += [string]$p }
     & $cp.exe @cpArgs
     exit $LASTEXITCODE
+  }
+  'init-instructions' {
+    $target = if ($Args.Count -ge 2) { [string]$Args[1] } else { (Get-Location).Path }
+    $path = Get-AgentsFilePath $target
+    $block = $script:GuardMarker + "`n## Modo de ejecucion (ask-cli)`n`n" + (Get-GuardText) + "`n" + $script:GuardMarker
+    if (Test-Path $path) {
+      $existing = Get-Content $path -Raw
+      if ($existing -like ('*' + $script:GuardMarker + '*')) {
+        # Reemplaza el bloque anterior entre marcadores (idempotente).
+        $pattern = [regex]::Escape($script:GuardMarker) + '[\s\S]*?' + [regex]::Escape($script:GuardMarker)
+        $updated = [regex]::Replace($existing, $pattern, [System.Text.RegularExpressions.MatchEvaluator] { param($m) $block })
+        Write-Utf8NoBom $path $updated
+        Write-Host ("Bloque actualizado en: " + $path)
+      } else {
+        Write-Utf8NoBom $path ($existing.TrimEnd() + "`n`n" + $block + "`n")
+        Write-Host ("Bloque anadido a: " + $path)
+      }
+    } else {
+      Write-Utf8NoBom $path ("# AGENTS.md`n`n" + $block + "`n")
+      Write-Host ("Creado: " + $path)
+    }
+    Write-Host "El guard ahora vive en las instrucciones cacheadas; ask-cli dejara de anteponerlo (guard=auto)."
+    exit 0
   }
   'sessions' {
     $sub = if ($Args.Count -ge 2) { [string]$Args[1] } else { 'list' }
@@ -851,6 +1182,15 @@ switch ($cmd) {
       Write-Host ("hanstlers: OK model=" + $state.model)
     } catch { Write-Host "hanstlers: WARN (no responde en :8717)" }
     Write-Host ("timeoutSec: " + $vtimeout + " (aplica al provider vertex)")
+    Write-Host ("verify: " + $(if (ConvertTo-BoolValue $cfg.verify $true) { 'ON (gates de ejecucion; exit 3 si falla)' } else { 'OFF' }))
+    Write-Host ("retry: " + $(if (ConvertTo-BoolValue $cfg.retry $true) { 'ON (reintento sobre la misma sesion)' } else { 'OFF' }))
+    $gm = if ($cfg.guard) { [string]$cfg.guard } else { 'auto' }
+    $gdir = (Get-Location).Path
+    if (Test-HasPersistentGuard $gdir) {
+      Write-Host ("guard: $gm - OK (persistente en " + (Get-AgentsFilePath $gdir) + "; 0 tokens extra por llamada)")
+    } else {
+      Write-Host ("guard: $gm - WARN (se antepone en cada prompt; usa 'ask-cli init-instructions' para cachearlo)")
+    }
     Write-Host ("config: " + $ConfigPath)
     Write-Host ("history: " + $HistoryPath)
     if (Test-Path $HistoryPath) {
