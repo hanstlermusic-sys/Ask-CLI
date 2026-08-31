@@ -807,10 +807,48 @@ Describe 'v0.5.0 - ejecucion del gate de calidad' {
     $g.exitCode | Should -Be 7
     $g.output | Should -Match 'TEST_FALLA_AQUI'
   }
-  It 'restaura el directorio de trabajo incluso al fallar' {
+  It 'no altera el directorio de trabajo del proceso actual' {
     $before = (Get-Location).Path
     Invoke-QualityGate $env:TEMP 'cmd /c exit 1' 60 | Out-Null
     (Get-Location).Path | Should -Be $before
+  }
+
+  # REGRESION: la primera version usaba Invoke-Expression + $LASTEXITCODE en el
+  # proceso actual. $LASTEXITCODE solo lo actualizan los ejecutables nativos, asi
+  # que con cmdlets arrastraba el valor de un comando anterior: una suite en rojo
+  # se reportaba VERDE. Un gate anti-alucinacion con falsos verdes es peor que no
+  # tener gate, asi que se ejecuta en un proceso hijo con exit code real.
+  It 'no hereda un $LASTEXITCODE contaminado cuando el comando es un cmdlet' {
+    cmd /c exit 7 | Out-Null
+    $g = Invoke-QualityGate (Get-Location).Path 'Write-Output "todo bien"' 60
+    $g.ok | Should -BeTrue
+    $g.exitCode | Should -Be 0
+  }
+  It 'detecta el fallo de un cmdlet aunque $LASTEXITCODE valga 0' {
+    cmd /c exit 0 | Out-Null
+    $g = Invoke-QualityGate (Get-Location).Path 'Write-Error "la suite fallo"' 60
+    $g.ok | Should -BeFalse
+  }
+  It 'detecta una excepcion terminante' {
+    (Invoke-QualityGate (Get-Location).Path 'throw "boom"' 60).ok | Should -BeFalse
+  }
+  It 'propaga el exit code exacto de un proceso nativo' {
+    (Invoke-QualityGate (Get-Location).Path 'cmd /c exit 3' 60).exitCode | Should -Be 3
+  }
+  It 'preserva comillas y ampersands en el comando (via -EncodedCommand)' {
+    $g = Invoke-QualityGate (Get-Location).Path 'Write-Output "con ""comillas"" dentro"' 60
+    $g.ok | Should -BeTrue
+    $g = Invoke-QualityGate (Get-Location).Path 'cmd /c "echo a & echo b"' 60
+    $g.ok | Should -BeTrue
+  }
+  It 'aborta y marca timedOut cuando la suite se cuelga' {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $g = Invoke-QualityGate (Get-Location).Path 'Start-Sleep -Seconds 30' 3
+    $sw.Stop()
+    $g.ok | Should -BeFalse
+    $g.timedOut | Should -BeTrue
+    $g.exitCode | Should -Be 124
+    $sw.Elapsed.TotalSeconds | Should -BeLessThan 15
   }
   It 'no lanza excepcion con un comando inexistente' {
     { Invoke-QualityGate (Get-Location).Path 'comando-que-no-existe-xyz' 60 } | Should -Not -Throw
@@ -889,5 +927,117 @@ Describe 'v0.5.0 - degradacion de --effort en modelos incompatibles' {
     $s = @{} ; foreach ($k in $script:base.Keys) { $s[$k] = $script:base[$k] }
     Invoke-AskPrompt 'di hola' $s $script:opts @{ verify=$false; retry=$false } | Out-Null
     $s.effort | Should -Be 'high'
+  }
+}
+
+
+Describe 'v0.5.0 - deteccion inmune a dependencias de terceros' {
+  BeforeAll {
+    $script:vd = Join-Path ([System.IO.Path]::GetTempPath()) ('vend-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path (Join-Path $script:vd 'node_modules\lib\test') -Force | Out-Null
+    '{}' | Set-Content (Join-Path $script:vd 'package.json')
+    '' | Set-Content (Join-Path $script:vd 'node_modules\lib\test\Vendor.Tests.ps1')
+  }
+  AfterAll { Remove-Item $script:vd -Recurse -Force -ErrorAction SilentlyContinue }
+
+  # REGRESION: un *.Tests.ps1 dentro de node_modules pertenece a un tercero. La
+  # primera version lo detectaba y ejecutaba Pester en un repo Node.
+  It 'ignora tests que viven dentro de node_modules' {
+    (Get-QualityCommand $script:vd '').name | Should -Be 'node'
+  }
+  It 'si detecta un test propio fuera de las dependencias' {
+    '' | Set-Content (Join-Path $script:vd 'Propio.Tests.ps1')
+    (Get-QualityCommand $script:vd '').name | Should -Be 'pester'
+    Remove-Item (Join-Path $script:vd 'Propio.Tests.ps1') -Force
+  }
+  It 'ignora proyectos .NET dentro de directorios de artefactos' {
+    $d = Join-Path $script:vd 'net'
+    New-Item -ItemType Directory -Path (Join-Path $d 'obj') -Force | Out-Null
+    '' | Set-Content (Join-Path $d 'obj\Generado.csproj')
+    'module x' | Set-Content (Join-Path $d 'go.mod')
+    (Get-QualityCommand $d '').name | Should -Be 'go'
+  }
+}
+
+
+Describe 'v0.5.0 - el gate de calidad no borra la evidencia de verificacion' {
+  BeforeAll {
+    $script:qs = @{
+      provider='copilot'; model='auto'; mode='trusted'; output='text'; dir=''
+      allowTools=''; denyTools=''; timeoutSec=60; agent=''; maxCredits=0; guard='off'
+      agentMode='autopilot'; effort=''; assistedApproval=$false; noAskUser=$false
+      maxContinues=0; qualityGate=$true; verifyCommand='cmd /c exit 0'
+    }
+    $script:qo = @{ resume=''; quiet=$true; verify=$true; retry=$true; quality=$true; attachments=@(); addDirs=@() }
+  }
+
+  # REGRESION: el reintento del gate asignaba verified=$true e issues=@() a ciegas.
+  # Si la verificacion determinista ya habia fallado, sus issues legitimos se
+  # perdian en cuanto la suite acababa en verde: la corrida mas sospechosa (dos
+  # reintentos) era la que salia mas limpia.
+  It 'no marca como verificada una respuesta que sigue sin ejecutar nada' {
+        Mock Invoke-CopilotPrompt {
+      @{ code=0; text='Ya cree el archivo config.json.'; resume='s1'; raw=''
+         toolCalls=([System.Collections.Generic.List[object]]::new()); toolFailed=0; filesModified=@(); usage=@{} }
+    }
+    Mock Get-QualityCommand { @{ name='custom'; cmd='cmd /c exit 0' } }
+    Mock Test-HasWriteTool { $true }          # fuerza a que el gate se ejecute
+    Mock Invoke-QualityGate { @{ ok=$false; exitCode=1; output='1 failed'; command='x'; ms=1; timedOut=$false } }
+
+    $r = Invoke-AskPrompt 'crea el archivo config.json' $script:qs $script:qo @{ verify=$true; retry=$true }
+    $r.verified | Should -BeFalse
+    @($r.issues).Count | Should -BeGreaterThan 0
+  }
+
+  It 'acumula toolFailed de ambos turnos en el reintento de calidad' {
+    $script:n = 0
+    Mock Invoke-CopilotPrompt {
+      $script:n++
+      # 2 herramientas con 1 fallo: la verificacion determinista pasa (no fallaron
+      # todas), de modo que el unico reintento posible es el del gate de calidad.
+      $l = [System.Collections.Generic.List[object]]::new()
+      $l.Add(@{ name='edit'; summary='x'; success=$true })
+      $l.Add(@{ name='powershell'; summary='y'; success=$false })
+      @{ code=0; text='listo'; resume='s1'; raw=''; toolCalls=$l; toolFailed=1
+         filesModified=@('a.py'); usage=@{} }
+    }
+    Mock Get-QualityCommand { @{ name='custom'; cmd='cmd /c exit 0' } }
+    $script:g = 0
+    Mock Invoke-QualityGate {
+      $script:g++
+      if ($script:g -eq 1) { @{ ok=$false; exitCode=1; output='rojo'; command='x'; ms=1; timedOut=$false } }
+      else { @{ ok=$true; exitCode=0; output=''; command='x'; ms=1; timedOut=$false } }
+    }
+    $r = Invoke-AskPrompt 'arregla el bug de suma' $script:qs $script:qo @{ verify=$true; retry=$true }
+    $script:n | Should -Be 2
+    $r.toolFailed | Should -Be 2
+    $r.quality.ok | Should -BeTrue
+  }
+
+  It 'expone el fallo de la suite en issues cuando queda roja' {
+    Mock Invoke-CopilotPrompt {
+      $l = [System.Collections.Generic.List[object]]::new()
+      $l.Add(@{ name='edit'; summary='x'; success=$true })
+      @{ code=0; text='arreglado'; resume=''; raw=''; toolCalls=$l; toolFailed=0
+         filesModified=@('a.py'); usage=@{} }
+    }
+    Mock Get-QualityCommand { @{ name='custom'; cmd='mi-suite' } }
+    Mock Invoke-QualityGate { @{ ok=$false; exitCode=2; output='2 failed'; command='mi-suite'; ms=1; timedOut=$false } }
+    $r = Invoke-AskPrompt 'arregla el bug' $script:qs $script:qo @{ verify=$true; retry=$true }
+    $r.verified | Should -BeFalse
+    ($r.issues -join ' ') | Should -Match 'suite del proyecto falla'
+    Get-AskExitCode $r | Should -Be 3
+  }
+
+  It 'omite el gate cuando no se toco codigo' {
+    Mock Invoke-CopilotPrompt {
+      $l = [System.Collections.Generic.List[object]]::new()
+      $l.Add(@{ name='view'; summary='x'; success=$true })
+      @{ code=0; text='La funcion suma dos enteros.'; resume=''; raw=''; toolCalls=$l
+         toolFailed=0; filesModified=@(); usage=@{} }
+    }
+    Mock Invoke-QualityGate { throw 'el gate NO deberia ejecutarse sin cambios de codigo' }
+    $r = Invoke-AskPrompt 'que hace la funcion add?' $script:qs $script:qo @{ verify=$true; retry=$true }
+    $r.quality | Should -BeNullOrEmpty
   }
 }

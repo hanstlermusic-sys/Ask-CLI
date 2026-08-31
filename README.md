@@ -178,7 +178,9 @@ el proyecto siga compilando o que los tests pasen. ask-cli sí:
 2. Si tocó código, ask-cli **ejecuta la suite real del proyecto**.
 3. Si falla, le devuelve la salida literal del test (no un resumen) sobre la misma sesión y le exige
    corregir la causa raíz, prohibiendo explícitamente tocar los tests para forzar un verde.
-4. Vuelve a ejecutar la suite. Solo entonces sale con `0`.
+4. Vuelve a ejecutar la suite **y vuelve a pasar los gates de verificación**: que la suite acabe en
+   verde no borra que el agente afirmara haber hecho algo que no hizo.
+5. Solo entonces sale con `0`. Si la suite sigue roja, sale con `3` y el fallo aparece en `issues`.
 
 Ejemplo real: ante `add` (bug) y `divide` (sin validar división por cero), pidiendo *sólo* arreglar
 `add`, el agente arregló `add` y emitió `task_complete`. El gate detectó que `test_divide_by_zero`
@@ -200,6 +202,18 @@ Se elige el primer marcador presente, de más específico a más genérico:
 
 Con `--verify-cmd "<comando>"` (o `verifyCommand` en config) fijas el tuyo y te saltas la detección.
 Si no hay suite detectable, el gate se omite con un aviso: nunca bloquea por no encontrar tests.
+
+Las búsquedas recursivas ignoran `node_modules`, `.venv`, `site-packages`, `target`, `vendor`,
+`obj`, `dist` y similares: un `*.Tests.ps1` dentro de una dependencia pertenece a un tercero y
+detectarlo elegiría el stack equivocado.
+
+La suite se ejecuta en un **proceso hijo**, no en la sesión actual. Esto no es un detalle de
+implementación: `$LASTEXITCODE` solo lo actualizan los ejecutables nativos, así que evaluar un
+cmdlet (`Invoke-Pester`) en el proceso actual arrastra el código de salida de un comando anterior
+y puede reportar **verde una suite en rojo**. El proceso hijo garantiza un exit code real, aplica
+el timeout de verdad (`exitCode` 124 y `timedOut` si se excede) e impide que un `exit` dentro del
+comando de verificación mate el wrapper. El comando viaja como `-EncodedCommand`, de modo que
+comillas y ampersands en un `verifyCommand` propio llegan intactos.
 
 ### Autonomía del agente
 

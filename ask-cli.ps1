@@ -571,14 +571,29 @@ $script:ValidAgentMode = @('interactive', 'plan', 'autopilot')
 
 # Comandos de verificacion por stack. El orden importa: se elige el primer marcador
 # que exista, de mas especifico a mas generico.
+#
+# Las busquedas recursivas EXCLUYEN directorios de dependencias y artefactos: un
+# *.Tests.ps1 dentro de node_modules pertenece a un tercero, no al proyecto, y
+# detectarlo elegiria el stack equivocado (ademas de recorrer arboles enormes).
+$script:VendorDirRegex = [regex]::new(
+  '(^|[\\/])(node_modules|\.git|\.venv|venv|__pycache__|bin|obj|dist|build|target|vendor|packages|\.tox|site-packages)([\\/]|$)',
+  [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+function Find-ProjectFile([string]$dir, [string[]]$include) {
+  $found = Get-ChildItem $dir -Recurse -Include $include -File -ErrorAction SilentlyContinue |
+    Where-Object { -not $script:VendorDirRegex.IsMatch($_.FullName.Substring($dir.Length)) } |
+    Select-Object -First 1
+  return [bool]$found
+}
+
 $script:QualityProbes = @(
-  @{ name = 'pester';  marker = { param($d) @(Get-ChildItem $d -Recurse -Filter '*.Tests.ps1' -File -ErrorAction SilentlyContinue | Select-Object -First 1).Count -gt 0 }
+  @{ name = 'pester';  marker = { param($d) Find-ProjectFile $d @('*.Tests.ps1') }
      cmd = 'Invoke-Pester -Path . -Output None -CI' }
   @{ name = 'node';    marker = { param($d) Test-Path (Join-Path $d 'package.json') }
      cmd = 'npm test --silent' }
   @{ name = 'python';  marker = { param($d) (Test-Path (Join-Path $d 'pytest.ini')) -or (Test-Path (Join-Path $d 'pyproject.toml')) -or (Test-Path (Join-Path $d 'setup.cfg')) -or (Test-Path (Join-Path $d 'tests')) -or @(Get-ChildItem $d -Filter 'test_*.py' -File -ErrorAction SilentlyContinue | Select-Object -First 1).Count -gt 0 }
      cmd = 'python -m pytest -q' }
-  @{ name = 'dotnet';  marker = { param($d) @(Get-ChildItem $d -Recurse -Include '*.sln', '*.csproj' -File -ErrorAction SilentlyContinue | Select-Object -First 1).Count -gt 0 }
+  @{ name = 'dotnet';  marker = { param($d) Find-ProjectFile $d @('*.sln', '*.csproj') }
      cmd = 'dotnet test --nologo -v q' }
   @{ name = 'go';      marker = { param($d) Test-Path (Join-Path $d 'go.mod') }
      cmd = 'go test ./...' }
@@ -598,24 +613,55 @@ function Get-QualityCommand([string]$dir, [string]$override) {
 
 # Ejecuta la suite real del proyecto. "El modelo dijo que pasan" no es evidencia:
 # esto la produce.
+#
+# Se ejecuta en un PROCESO HIJO a proposito. Invoke-Expression en el proceso actual
+# no permite decidir el exito de forma fiable: $LASTEXITCODE solo lo actualizan los
+# ejecutables nativos, asi que con cmdlets (Invoke-Pester) arrastra el valor de un
+# comando anterior y produce falsos verdes. Un proceso hijo siempre tiene exit code
+# real, aisla el estado de la sesion y ademas hace aplicable el timeout.
 function Invoke-QualityGate([string]$dir, [string]$command, [int]$timeoutSec) {
   $d = if ($dir) { $dir } else { (Get-Location).Path }
-  $out = New-Object System.Text.StringBuilder
-  $exit = 0
-  $prev = Get-Location
+  $limit = if ($timeoutSec -gt 0) { $timeoutSec } else { 600 }
+  $host_ = if (Get-Command 'pwsh' -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+  $outFile = Join-Path ([System.IO.Path]::GetTempPath()) ('askcli-q-' + [Guid]::NewGuid().ToString('N') + '.out')
+  $errFile = $outFile + '.err'
+  # ErrorActionPreference=Stop hace que un cmdlet que escribe error termine con exit != 0;
+  # sin el, Write-Error saldria como exito.
+  $inner = '$ErrorActionPreference=''Stop''; $global:LASTEXITCODE=0; try { ' + $command + ' } catch { Write-Error $_; exit 1 }; exit $LASTEXITCODE'
+  # -EncodedCommand en vez de -Command: pasar el comando como argumento suelto lo
+  # somete a un segundo parseo que destroza comillas y ampersands (un verifyCommand
+  # como: pytest -k "not slow"  llegaria roto). Base64 UTF-16LE viaja intacto.
+  $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
   try {
-    Set-Location $d
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $lines = @(Invoke-Expression "$command 2>&1" | ForEach-Object { [string]$_ })
-    $exit = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+    $p = Start-Process -FilePath $host_ -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded) `
+      -WorkingDirectory $d -NoNewWindow -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+    # Tocar .Handle fuerza a .NET a cachear el handle del proceso; sin esto,
+    # .ExitCode queda vacio despues de que el proceso termina y todo parece fallar.
+    $null = $p.Handle
+    if (-not $p.WaitForExit($limit * 1000)) {
+      try { $p.Kill() } catch {}
+      $sw.Stop()
+      return @{ ok = $false; exitCode = 124; timedOut = $true; command = $command; ms = $sw.ElapsedMilliseconds
+                output = ("La verificacion excedio el timeout de " + $limit + "s y fue abortada.") }
+    }
     $sw.Stop()
+    $exit = $p.ExitCode
+    $lines = @()
+    foreach ($f in @($outFile, $errFile)) {
+      if (Test-Path $f) { $lines += @(Get-Content $f -ErrorAction SilentlyContinue) }
+    }
     # Solo interesa la cola: es donde viven los fallos y los resumenes.
     $tail = if ($lines.Count -gt 40) { $lines[-40..-1] } else { $lines }
-    foreach ($l in $tail) { [void]$out.AppendLine($l) }
-    return @{ ok = ($exit -eq 0); exitCode = $exit; output = $out.ToString().Trim(); ms = $sw.ElapsedMilliseconds; command = $command }
+    return @{ ok = ($exit -eq 0); exitCode = $exit; timedOut = $false; command = $command
+              ms = $sw.ElapsedMilliseconds; output = (($tail -join [Environment]::NewLine).Trim()) }
   } catch {
-    return @{ ok = $false; exitCode = 1; output = ('No se pudo ejecutar la verificacion: ' + $_.Exception.Message); ms = 0; command = $command }
-  } finally { Set-Location $prev }
+    $sw.Stop()
+    return @{ ok = $false; exitCode = 1; timedOut = $false; command = $command; ms = $sw.ElapsedMilliseconds
+              output = ('No se pudo ejecutar la verificacion: ' + $_.Exception.Message) }
+  } finally {
+    Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
+  }
 }
 
 function Build-QualityFeedback([hashtable]$gate) {
@@ -967,18 +1013,28 @@ function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opt
       if (-not $opts.quiet) { Write-Notice '[ask-cli] gate de calidad: no se detecto suite de tests, se omite' $settings 'DarkGray' }
     } else {
       if (-not $opts.quiet) { Write-Notice ("[ask-cli] gate de calidad (" + $qc.name + "): " + $qc.cmd) $settings 'DarkCyan' }
-      $gate = Invoke-QualityGate $settings.dir $qc.cmd $settings.timeoutSec
+      $gate = Invoke-QualityGate (Get-Prop $settings 'dir') $qc.cmd $settings.timeoutSec
 
       if (-not $gate.ok -and $wantRetry -and $res.resume) {
         if (-not $opts.quiet) { Write-Notice '[ask-cli] la suite falla, devolviendo el error al agente...' $settings }
         $fix = Invoke-CopilotPrompt (Build-QualityFeedback $gate) $settings $opts '' $res.resume
         if ($fix.code -eq 0) {
           foreach ($t in $res.toolCalls) { $fix.toolCalls.Add($t) }
+          $fix.toolFailed = $fix.toolFailed + $res.toolFailed
           if (@($fix.filesModified).Count -eq 0) { $fix.filesModified = $res.filesModified }
-          $fix.verified = $true
-          $fix.issues = @()
           $res = $fix
-          $gate = Invoke-QualityGate $settings.dir $qc.cmd $settings.timeoutSec
+          # Re-verificar en vez de asumir el exito: que la suite acabe en verde no
+          # borra que el agente afirmara haber hecho algo que no hizo. Asignar
+          # verified=$true a ciegas descartaba issues legitimos del turno anterior.
+          if ($wantVerify) {
+            $verification = Test-ResponseVerification $res $prompt
+            $res.verified = [bool]$verification.ok
+            $res.issues = @($verification.issues)
+          } else {
+            $res.verified = $true
+            $res.issues = @()
+          }
+          $gate = Invoke-QualityGate (Get-Prop $settings 'dir') $qc.cmd $settings.timeoutSec
         }
       }
 
