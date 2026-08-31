@@ -12,8 +12,49 @@ $ConfigPath = Join-Path $AskHome 'config.json'
 $HistoryPath = Join-Path $AskHome 'history.jsonl'
 $ProfilesPath = Join-Path $AskHome 'project-profiles.json'
 
+$script:AskCliVersion = '0.3.0'
+$script:ResolvedCopilot = ''
+$script:Invoker = $null
+$script:Cfg = $null
+
+$RxCompiled = [System.Text.RegularExpressions.RegexOptions]::Compiled
+
+# Ruido de PowerShell/Node que nunca aporta nada al usuario: se descarta siempre.
+# Nota: PowerShell emite CategoryInfo/FullyQualifiedErrorId con prefijo "    + ", de ahi el \+? opcional.
+$script:NoiseRegex = [regex]::new(
+  '^\s*(?:node\.exe\s*:|[A-Za-z]:\\.*\\(?:cmd|powershell|node)\.exe\s*:|At line:\d+ char:\d+|En\s+l[ií]nea:\s*\d+|En\s+.+copilot\.ps1:|\+.*npm-loader\.js|\+\s*&\s|~{5,}\s*$|\+?\s*CategoryInfo\b|\+?\s*FullyQualifiedErrorId\b|System\.Management\.Automation\.RemoteException\s*$)',
+  $RxCompiled)
+
+# Telemetria util (creditos, tokens, diff, resume): oculta por defecto, visible con --verbose.
+$script:TelemetryRegex = [regex]::new(
+  '^\s*(?:Changes\s+\+\d+\s+-\d+\s*$|AI Credits\b|Tokens\b|Resume\s+copilot\s+--resume=)',
+  $RxCompiled)
+
+$script:ResumeRegex = [regex]::new('--resume=([0-9a-fA-F-]{8,})', $RxCompiled)
+
 function Ensure-AskHome {
   if (-not (Test-Path $AskHome)) { New-Item -ItemType Directory -Path $AskHome | Out-Null }
+}
+
+function Write-Utf8NoBom([string]$path, [string]$content) {
+  $enc = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($path, $content, $enc)
+}
+
+function ConvertTo-BoolValue($value, [bool]$fallback) {
+  if ($null -eq $value) { return $fallback }
+  if ($value -is [bool]) { return $value }
+  $s = ([string]$value).Trim().ToLower()
+  if ($s -in @('1', 'true', 'on', 'yes', 'si')) { return $true }
+  if ($s -in @('0', 'false', 'off', 'no')) { return $false }
+  return $fallback
+}
+
+function ConvertTo-IntValue($value, [int]$fallback) {
+  if ($null -eq $value) { return $fallback }
+  $n = 0
+  if ([int]::TryParse([string]$value, [ref]$n)) { return $n }
+  return $fallback
 }
 
 function Default-Config {
@@ -26,6 +67,11 @@ function Default-Config {
     output = 'text' # text|json
     lastResume = ''
     lastVertexConvId = ''
+    copilotPath = ''      # cache de la ruta resuelta de copilot.cmd
+    allowTools = 'view,glob,rg'
+    timeoutSec = 180
+    historyMax = 2000
+    retry = $true
   }
 }
 
@@ -38,7 +84,13 @@ function Load-Config {
       if ($raw) {
         $obj = ConvertFrom-Json $raw -ErrorAction Stop
         foreach ($p in $obj.PSObject.Properties) {
-          if ($cfg.ContainsKey($p.Name) -and $null -ne $p.Value) { $cfg[$p.Name] = [string]$p.Value }
+          if ($cfg.ContainsKey($p.Name) -and $null -ne $p.Value) {
+            if ($p.Value -is [bool] -or $p.Value -is [int] -or $p.Value -is [long] -or $p.Value -is [double]) {
+              $cfg[$p.Name] = $p.Value
+            } else {
+              $cfg[$p.Name] = [string]$p.Value
+            }
+          }
         }
       }
     } catch {}
@@ -48,7 +100,7 @@ function Load-Config {
 
 function Save-Config($cfg) {
   Ensure-AskHome
-  ($cfg | ConvertTo-Json -Depth 6) | Out-File -FilePath $ConfigPath -Encoding utf8
+  Write-Utf8NoBom $ConfigPath ($cfg | ConvertTo-Json -Depth 6)
 }
 
 function Convert-ObjectToHashtable($obj) {
@@ -87,7 +139,7 @@ function Load-Profiles {
 
 function Save-Profiles($profiles) {
   Ensure-AskHome
-  ($profiles | ConvertTo-Json -Depth 8) | Out-File -FilePath $ProfilesPath -Encoding utf8
+  Write-Utf8NoBom $ProfilesPath ($profiles | ConvertTo-Json -Depth 8)
 }
 
 function Resolve-FullPath([string]$pathInput) {
@@ -139,6 +191,10 @@ function Resolve-Settings($cfg, [hashtable]$opts) {
   $out.mode = if ($opts.mode) { $opts.mode } elseif ($profile -and $profile.mode) { [string]$profile.mode } else { [string]$cfg.mode }
   $out.output = if ($opts.output) { $opts.output } else { [string]$cfg.output }
   $out.dir = if ($opts.dir) { $opts.dir } elseif ($profile -and $profile.dir) { [string]$profile.dir } else { [string]$cfg.dir }
+  $out.allowTools = if ($opts.allowTools) { [string]$opts.allowTools } elseif ($profile -and $profile.allowTools) { [string]$profile.allowTools } else { [string]$cfg.allowTools }
+  if (-not $out.allowTools) { $out.allowTools = 'view,glob,rg' }
+  $out.timeoutSec = if ((ConvertTo-IntValue $opts.timeoutSec 0) -gt 0) { ConvertTo-IntValue $opts.timeoutSec 180 } else { ConvertTo-IntValue $cfg.timeoutSec 180 }
+  if ($out.timeoutSec -le 0) { $out.timeoutSec = 180 }
   return $out
 }
 
@@ -188,11 +244,53 @@ function Apply-ProfilePolicy($cfg, [hashtable]$opts, [hashtable]$settings) {
 }
 
 function Get-CopilotCmd {
-  $cmd = Get-Command 'copilot.cmd' -ErrorAction SilentlyContinue
-  if ($cmd -and $cmd.Path) { return $cmd.Path }
-  $cmd2 = Get-Command 'copilot' -ErrorAction SilentlyContinue
-  if ($cmd2 -and $cmd2.Path) { return $cmd2.Path }
-  throw "Copilot CLI no encontrado en PATH."
+  if ($script:ResolvedCopilot -and (Test-Path $script:ResolvedCopilot)) { return $script:ResolvedCopilot }
+  $cached = ''
+  if ($script:Cfg -and $script:Cfg.ContainsKey('copilotPath')) { $cached = [string]$script:Cfg.copilotPath }
+  if ($cached -and (Test-Path $cached)) {
+    $script:ResolvedCopilot = $cached
+    return $cached
+  }
+  $found = ''
+  foreach ($name in @('copilot.cmd', 'copilot')) {
+    $c = Get-Command $name -ErrorAction SilentlyContinue
+    if ($c -and $c.Path) { $found = $c.Path; break }
+  }
+  if (-not $found) { throw "Copilot CLI no encontrado en PATH." }
+  $script:ResolvedCopilot = $found
+  if ($script:Cfg -and $script:Cfg.ContainsKey('copilotPath') -and ([string]$script:Cfg.copilotPath) -ne $found) {
+    $script:Cfg.copilotPath = $found
+    try { Save-Config $script:Cfg } catch {}
+  }
+  return $found
+}
+
+# copilot.cmd es un shim npm que pasa por cmd.exe, y cmd.exe TRUNCA los argumentos
+# en el primer salto de linea: el prompt multilinea perderia todo despues del guard.
+# Por eso resolvemos el entrypoint real (node + npm-loader.js) y lo invocamos directo.
+function Get-CopilotInvoker {
+  if ($null -ne $script:Invoker) { return $script:Invoker }
+  $cmdPath = Get-CopilotCmd
+  $inv = @{ exe = $cmdPath; prefix = @(); multiline = $false }
+  try {
+    $dir = Split-Path -Parent $cmdPath
+    $js = Join-Path $dir 'node_modules\@github\copilot\npm-loader.js'
+    if (Test-Path $js) {
+      $node = Join-Path $dir 'node.exe'
+      if (-not (Test-Path $node)) {
+        $nc = Get-Command 'node' -ErrorAction SilentlyContinue
+        $node = if ($nc -and $nc.Path) { $nc.Path } else { '' }
+      }
+      if ($node) { $inv = @{ exe = $node; prefix = @($js); multiline = $true } }
+    }
+  } catch {}
+  $script:Invoker = $inv
+  return $inv
+}
+
+# Fallback para el shim .cmd: aplana el prompt para que cmd.exe no lo trunque.
+function ConvertTo-SingleLinePrompt([string]$text) {
+  return ((([string]$text) -replace "`r`n", "`n") -replace "`n+", ' | ').Trim()
 }
 
 function Build-ExecutionFirstPrompt([string]$prompt) {
@@ -212,6 +310,8 @@ INSTRUCCION OPERATIVA:
 function Is-NonOperationalCopilotReply([string]$text) {
   $t = [string]$text
   if (-not $t.Trim()) { return $true }
+  # Una respuesta larga ya representa trabajo real: nunca vale la pena pagar un segundo round-trip.
+  if ($t.Length -gt 400) { return $false }
   $low = $t.ToLower()
   if ($low -match '^\s*listo[,.\s]*entendido') { return $true }
   if ($low -match '^\s*entendido\.\s*estoy listo y operativo') { return $true }
@@ -224,12 +324,23 @@ function Is-NonOperationalCopilotReply([string]$text) {
 function Append-History([hashtable]$entry) {
   Ensure-AskHome
   $line = ($entry | ConvertTo-Json -Depth 8 -Compress)
-  Add-Content -Path $HistoryPath -Value $line
+  Add-Content -Path $HistoryPath -Value $line -Encoding UTF8
+  $max = 2000
+  if ($script:Cfg) { $max = ConvertTo-IntValue $script:Cfg.historyMax 2000 }
+  if ($max -le 0) { return }
+  # Chequeo por tamano: evita releer el archivo completo en cada invocacion.
+  try {
+    $info = Get-Item $HistoryPath -ErrorAction SilentlyContinue
+    if ($info -and $info.Length -gt 2MB) {
+      $keep = @(Get-Content $HistoryPath -Tail $max -ErrorAction SilentlyContinue)
+      Write-Utf8NoBom $HistoryPath (($keep -join "`n") + "`n")
+    }
+  } catch {}
 }
 
 function Get-LastResume {
   if (-not (Test-Path $HistoryPath)) { return '' }
-  $lines = Get-Content $HistoryPath -ErrorAction SilentlyContinue
+  $lines = @(Get-Content $HistoryPath -Tail 200 -ErrorAction SilentlyContinue)
   for ($i = $lines.Count - 1; $i -ge 0; $i--) {
     try {
       $obj = $lines[$i] | ConvertFrom-Json
@@ -240,50 +351,55 @@ function Get-LastResume {
 }
 
 function Invoke-CopilotPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opts) {
-  $cmd = Get-CopilotCmd
-  $args = @()
-  if ($settings.dir) { $args += @('-C', $settings.dir) }
-  if ($settings.model) { $args += @('--model', $settings.model) }
-  if ($opts.resume) { $args += @('--resume', $opts.resume) }
-  if ($opts.attachments) {
-    foreach ($a in $opts.attachments) { $args += @('--attachment', $a) }
-  }
+  $inv = Get-CopilotInvoker
+  $exe = [string]$inv.exe
+  $cargs = @() + $inv.prefix
+  if ($settings.dir) { $cargs += @('-C', $settings.dir) }
+  if ($settings.model) { $cargs += @('--model', $settings.model) }
+  if ($opts.resume) { $cargs += @('--resume', $opts.resume) }
+  foreach ($a in $opts.attachments) { $cargs += @('--attachment', [string]$a) }
+  foreach ($d in $opts.addDirs) { $cargs += @('--add-dir', [string]$d) }
   if ($settings.mode -eq 'trusted') {
-    $args += '--allow-all-tools'
+    $cargs += '--allow-all-tools'
   } else {
-    $args += @('--allow-tool', 'view,glob,rg')
+    $cargs += @('--allow-tool', [string]$settings.allowTools)
   }
-  if ($settings.output -eq 'json') { $args += @('--output-format', 'json') }
-  $args += @('--prompt', $prompt)
+  if ($settings.output -eq 'json') { $cargs += @('--output-format', 'json') }
+  foreach ($p in $opts.passthrough) { $cargs += [string]$p }
+  $finalPrompt = if ($inv.multiline) { $prompt } else { ConvertTo-SingleLinePrompt $prompt }
+  $cargs += @('--prompt', $finalPrompt)
 
-  $rawLines = @()
-  & $cmd @args 2>&1 | ForEach-Object { $rawLines += [string]$_ }
+  $rawLines = [System.Collections.Generic.List[string]]::new()
+  $filtered = [System.Collections.Generic.List[string]]::new()
+  $verbose = [bool]$opts.verbose
+  $stream = ($settings.output -ne 'json') -and (-not $opts.noStream)
+
+  # Streaming real: cada linea se filtra e imprime conforme el proceso la emite.
+  & $exe @cargs 2>&1 | ForEach-Object {
+    $line = [string]$_
+    $rawLines.Add($line)
+    if ($script:NoiseRegex.IsMatch($line)) { return }
+    if ((-not $verbose) -and $script:TelemetryRegex.IsMatch($line)) { return }
+    $filtered.Add($line)
+    if ($stream) { Write-Host $line }
+  }
   $exitCode = $LASTEXITCODE
+  if ($null -eq $exitCode) { $exitCode = 0 }
+
   $resume = ''
   foreach ($l in $rawLines) {
-    if ($l -match '--resume=([0-9a-fA-F-]{8,})') { $resume = $Matches[1] }
+    $m = $script:ResumeRegex.Match($l)
+    if ($m.Success) { $resume = $m.Groups[1].Value }
   }
-  $filtered = @()
-  foreach ($l in $rawLines) {
-    if ($l -match '^\s*Changes\s+\+\d+\s+-\d+\s*$') { continue }
-    if ($l -match '^\s*AI Credits\b') { continue }
-    if ($l -match '^\s*Tokens\b') { continue }
-    if ($l -match '^\s*Resume\s+copilot\s+--resume=') { continue }
-    if ($l -match '^\s*node\.exe\s*:') { continue }
-    if ($l -match '^\s*En\s+.+copilot\.ps1:') { continue }
-    if ($l -match '^\s*\+.*npm-loader\.js') { continue }
-    if ($l -match '^\s*~{5,}\s*$') { continue }
-    if ($l -match '^\s*CategoryInfo') { continue }
-    if ($l -match '^\s*FullyQualifiedErrorId') { continue }
-    if ($l -match '^\s*System\.Management\.Automation\.RemoteException\s*$') { continue }
-    $filtered += $l
-  }
-  $text = ($filtered -join [Environment]::NewLine).Trim()
+
+  $text = (($filtered -join [Environment]::NewLine)).Trim()
   return @{
     code = $exitCode
     text = $text
     resume = $resume
+    route = ''
     raw = ($rawLines -join [Environment]::NewLine)
+    streamed = ($stream -and $filtered.Count -gt 0)
   }
 }
 
@@ -301,7 +417,7 @@ function Invoke-VertexPrompt([string]$prompt, [hashtable]$settings, [hashtable]$
   $event = ''
   $route = ''
   $acc = ''
-  $error = ''
+  $errText = ''
   $doneCode = 0
   $rawLines = New-Object System.Collections.Generic.List[string]
   $printedStream = $false
@@ -310,8 +426,10 @@ function Invoke-VertexPrompt([string]$prompt, [hashtable]$settings, [hashtable]$
     $req = [System.Net.HttpWebRequest]::Create('http://127.0.0.1:8717/api/chat')
     $req.Method = 'POST'
     $req.ContentType = 'application/json'
-    $req.Timeout = 180000
-    $req.ReadWriteTimeout = 180000
+    $timeoutMs = (ConvertTo-IntValue $settings.timeoutSec 180) * 1000
+    if ($timeoutMs -le 0) { $timeoutMs = 180000 }
+    $req.Timeout = $timeoutMs
+    $req.ReadWriteTimeout = $timeoutMs
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
     $req.ContentLength = $bytes.Length
     $reqStream = $req.GetRequestStream()
@@ -344,7 +462,7 @@ function Invoke-VertexPrompt([string]$prompt, [hashtable]$settings, [hashtable]$
           try { $statusText = [string]($dataRaw | ConvertFrom-Json); if ($statusText) { Write-Host ("`n[status] " + $statusText) } } catch {}
         }
       } elseif ($event -eq 'error') {
-        try { $error = [string]($dataRaw | ConvertFrom-Json) } catch { $error = $dataRaw }
+        try { $errText = [string]($dataRaw | ConvertFrom-Json) } catch { $errText = $dataRaw }
       } elseif ($event -eq 'done') {
         try {
           $objDone = $dataRaw | ConvertFrom-Json
@@ -375,8 +493,34 @@ function Invoke-VertexPrompt([string]$prompt, [hashtable]$settings, [hashtable]$
   }
 
   $raw = ($rawLines -join "`n")
-  if ($error) { return @{ code = 1; text = $error; resume = $convId; route = $route; raw = $raw; streamed = $printedStream } }
+  if ($errText) { return @{ code = 1; text = $errText; resume = $convId; route = $route; raw = $raw; streamed = $printedStream } }
   return @{ code = $doneCode; text = $acc.Trim(); resume = $convId; route = $route; raw = $raw; streamed = $printedStream }
+}
+
+function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opts, [hashtable]$cfg) {
+  $effective = Build-ExecutionFirstPrompt $prompt
+  $res = if ($settings.provider -eq 'vertex') {
+    Invoke-VertexPrompt $effective $settings $opts $cfg
+  } else {
+    Invoke-CopilotPrompt $effective $settings $opts
+  }
+
+  $wantRetry = ConvertTo-BoolValue $opts.retry $true
+  if ($wantRetry) { $wantRetry = ConvertTo-BoolValue $cfg.retry $true }
+  if ($wantRetry -and ($res.code -eq 0) -and (Is-NonOperationalCopilotReply $res.text)) {
+    $retryPrompt = $effective + "`n`nREINTENTO OBLIGATORIO: ejecuta la tarea ahora, no pidas más datos intermedios."
+    if ($res.streamed -eq $true -and -not $opts.quiet) { Write-Host "[ask-cli] respuesta no operativa, reintentando..." }
+    $res = if ($settings.provider -eq 'vertex') {
+      Invoke-VertexPrompt $retryPrompt $settings $opts $cfg
+    } else {
+      Invoke-CopilotPrompt $retryPrompt $settings $opts
+    }
+  }
+
+  if ($res.resume) {
+    if ($settings.provider -eq 'vertex') { $cfg.lastVertexConvId = $res.resume } else { $cfg.lastResume = $res.resume }
+  }
+  return $res
 }
 
 function Show-Help {
@@ -384,24 +528,47 @@ function Show-Help {
 ask-cli - Wrapper avanzado para Copilot CLI + Vertex (HanstlerS)
 
 Uso:
-  ask-cli run "pregunta..." [--provider copilot|vertex] [--model <id>] [--resume <id>] [--json] [--quiet] [--no-stream]
+  ask-cli run "pregunta..." [opciones]
   ask-cli chat [--provider copilot] [--model <id>] [--resume <sessionId>]
   ask-cli resume [sessionId] [--provider copilot|vertex]
+  ask-cli sessions [list|clear] [n]
   ask-cli model show
   ask-cli model set <id>
   ask-cli auth status|login|logout
   ask-cli doctor
+  ask-cli version
   ask-cli project init [ruta] [--provider ...] [--model ...] [--strict-profile|--relaxed-profile]
   ask-cli project show [ruta]
   ask-cli project strict on|off [ruta]
   ask-cli config show
-  ask-cli config set <provider|model|vertexModel|mode|dir|output> <valor>
+  ask-cli config set <clave> <valor>
+
+Opciones:
+  --provider copilot|vertex   Backend a usar.
+  --model <id>                Modelo (copilot) o modelo directo.
+  --vertex-model <id>         Modelo para provider vertex.
+  --dir <ruta>                Directorio de trabajo (-C en Copilot CLI).
+  --add-dir <ruta>            Directorio extra de contexto (repetible).
+  --attach <ruta>             Adjunto (repetible).
+  --resume <id>               Reanuda sesion.
+  --allow-tool <lista>        Herramientas permitidas en modo safe.
+  --timeout <seg>             Timeout de red del provider vertex.
+  --json                      Salida JSON (desactiva streaming).
+  --quiet                     Sin mensajes accesorios.
+  --verbose                   Muestra telemetria (AI Credits, Tokens, Changes).
+  --no-stream                 Desactiva streaming incremental.
+  --no-retry                  No reintenta ante respuesta no operativa.
+  --safe | --trusted          Atajos de modo.
+  --force-profile-override    Ignora un perfil estricto.
+  --                          Todo lo que siga es prompt literal.
 
 Notas:
-  - Modo trusted: usa --allow-all-tools.
-  - Modo safe: limita permisos a view,glob,rg.
+  - Modo trusted: usa --allow-all-tools. Modo safe: limita a --allow-tool (default view,glob,rg).
+  - Flags --* no reconocidos se reenvian tal cual a Copilot CLI (passthrough), p.ej. MCP.
   - Provider vertex usa HanstlerS local API en http://127.0.0.1:8717/api/chat.
-  - Perfil estricto bloquea provider/model/mode/dir del proyecto; usa --force-profile-override para saltarlo.
+  - Perfil estricto bloquea provider/model/mode/dir del proyecto; usa --force-profile-override.
+  - Claves de config: provider, model, vertexModel, mode, dir, output, copilotPath,
+    allowTools, timeoutSec, historyMax, retry.
 '@ | Write-Host
 }
 
@@ -415,8 +582,14 @@ function Parse-Options([string[]]$tokens) {
     dir = ''
     resume = ''
     attachments = @()
+    addDirs = @()
+    passthrough = @()
+    allowTools = ''
+    timeoutSec = 0
     quiet = $false
     noStream = $false
+    verbose = $false
+    retry = $true
     forceProfileOverride = $false
     strictProfile = ''
     prompt = @()
@@ -432,20 +605,43 @@ function Parse-Options([string[]]$tokens) {
       '--dir'      { $i++; if ($i -lt $tokens.Count) { $opts.dir = [string]$tokens[$i] } }
       '--resume'   { $i++; if ($i -lt $tokens.Count) { $opts.resume = [string]$tokens[$i] } }
       '--attach'   { $i++; if ($i -lt $tokens.Count) { $opts.attachments += [string]$tokens[$i] } }
+      '--add-dir'  { $i++; if ($i -lt $tokens.Count) { $opts.addDirs += [string]$tokens[$i] } }
+      '--allow-tool' { $i++; if ($i -lt $tokens.Count) { $opts.allowTools = [string]$tokens[$i] } }
+      '--timeout'  { $i++; if ($i -lt $tokens.Count) { $opts.timeoutSec = ConvertTo-IntValue $tokens[$i] 0 } }
       '--json'     { $opts.output = 'json' }
       '--quiet'    { $opts.quiet = $true }
+      '--verbose'  { $opts.verbose = $true }
       '--no-stream' { $opts.noStream = $true }
+      '--no-retry' { $opts.retry = $false }
+      '--retry'    { $opts.retry = $true }
       '--safe'     { $opts.mode = 'safe' }
       '--trusted'  { $opts.mode = 'trusted' }
       '--force-profile-override' { $opts.forceProfileOverride = $true }
       '--strict-profile' { $opts.strictProfile = 'strict' }
       '--relaxed-profile' { $opts.strictProfile = 'relaxed' }
-      default      { $opts.prompt += $t }
+      default {
+        if ($t -eq '--') {
+          # Todo lo que sigue es prompt literal.
+          $i++
+          while ($i -lt $tokens.Count) { $opts.prompt += [string]$tokens[$i]; $i++ }
+        } elseif ($t.StartsWith('--')) {
+          # Flag desconocido: se reenvia tal cual a Copilot CLI (passthrough).
+          $opts.passthrough += $t
+          if (($i + 1) -lt $tokens.Count -and -not ([string]$tokens[$i + 1]).StartsWith('-')) {
+            $i++
+            $opts.passthrough += [string]$tokens[$i]
+          }
+        } else {
+          $opts.prompt += $t
+        }
+      }
     }
     $i++
   }
   return $opts
 }
+
+if ($env:ASKCLI_NO_MAIN -eq '1') { return }
 
 if (-not $Args -or $Args.Count -eq 0) {
   Show-Help
@@ -453,10 +649,11 @@ if (-not $Args -or $Args.Count -eq 0) {
 }
 
 $cfg = Load-Config
+$script:Cfg = $cfg
 $cmd = [string]$Args[0]
 
 # Backward compatibility: ask-cli "pregunta"
-if ($cmd -notin @('run','chat','resume','model','auth','doctor','project','config','help')) {
+if ($cmd -notin @('run','chat','resume','sessions','model','auth','doctor','project','config','help','version','--version','-v')) {
   $opts = Parse-Options @($Args)
   $settings = Resolve-Settings $cfg $opts
   try {
@@ -468,23 +665,7 @@ if ($cmd -notin @('run','chat','resume','model','auth','doctor','project','confi
   }
   $prompt = ($opts.prompt -join ' ').Trim()
   if (-not $prompt) { Show-Help; exit 1 }
-  $effectivePrompt = Build-ExecutionFirstPrompt $prompt
-  $res = $null
-  if ($settings.provider -eq 'vertex') {
-    $res = Invoke-VertexPrompt $effectivePrompt $settings $opts $cfg
-    if (($res.code -eq 0) -and (Is-NonOperationalCopilotReply $res.text)) {
-      $retryPrompt = $effectivePrompt + "`n`nREINTENTO OBLIGATORIO: ejecuta la tarea ahora, no pidas más datos intermedios."
-      $res = Invoke-VertexPrompt $retryPrompt $settings $opts $cfg
-    }
-    if ($res.resume) { $cfg.lastVertexConvId = $res.resume }
-  } else {
-    $res = Invoke-CopilotPrompt $effectivePrompt $settings $opts
-    if (($res.code -eq 0) -and (Is-NonOperationalCopilotReply $res.text)) {
-      $retryPrompt = $effectivePrompt + "`n`nREINTENTO OBLIGATORIO: ejecuta la tarea ahora, no pidas más datos intermedios."
-      $res = Invoke-CopilotPrompt $retryPrompt $settings $opts
-    }
-    if ($res.resume) { $cfg.lastResume = $res.resume }
-  }
+  $res = Invoke-AskPrompt $prompt $settings $opts $cfg
   Save-Config $cfg
   Append-History @{
     ts = (Get-Date).ToString('s')
@@ -507,6 +688,10 @@ switch ($cmd) {
     Show-Help
     exit 0
   }
+  { $_ -in @('version','--version','-v') } {
+    Write-Host ("ask-cli " + $script:AskCliVersion)
+    exit 0
+  }
   'run' {
     $opts = Parse-Options @($Args[1..($Args.Count-1)])
     $settings = Resolve-Settings $cfg $opts
@@ -519,23 +704,7 @@ switch ($cmd) {
     }
     $prompt = ($opts.prompt -join ' ').Trim()
     if (-not $prompt) { Write-Host "Falta prompt. Uso: ask-cli run `"tu pregunta`""; exit 1 }
-    $effectivePrompt = Build-ExecutionFirstPrompt $prompt
-    $res = $null
-    if ($settings.provider -eq 'vertex') {
-      $res = Invoke-VertexPrompt $effectivePrompt $settings $opts $cfg
-      if (($res.code -eq 0) -and (Is-NonOperationalCopilotReply $res.text)) {
-        $retryPrompt = $effectivePrompt + "`n`nREINTENTO OBLIGATORIO: ejecuta la tarea ahora, no pidas más datos intermedios."
-        $res = Invoke-VertexPrompt $retryPrompt $settings $opts $cfg
-      }
-      if ($res.resume) { $cfg.lastVertexConvId = $res.resume }
-    } else {
-      $res = Invoke-CopilotPrompt $effectivePrompt $settings $opts
-      if (($res.code -eq 0) -and (Is-NonOperationalCopilotReply $res.text)) {
-        $retryPrompt = $effectivePrompt + "`n`nREINTENTO OBLIGATORIO: ejecuta la tarea ahora, no pidas más datos intermedios."
-        $res = Invoke-CopilotPrompt $retryPrompt $settings $opts
-      }
-      if ($res.resume) { $cfg.lastResume = $res.resume }
-    }
+    $res = Invoke-AskPrompt $prompt $settings $opts $cfg
     Save-Config $cfg
     Append-History @{
       ts = (Get-Date).ToString('s')
@@ -568,14 +737,42 @@ switch ($cmd) {
       Write-Host "Chat interactivo continuo no aplica para provider=vertex. Usa: ask-cli run ""prompt"" --provider vertex"
       exit 1
     }
-    $cp = Get-CopilotCmd
-    $cpArgs = @()
+    $cp = Get-CopilotInvoker
+    $cpArgs = @() + $cp.prefix
     if ($settings.dir) { $cpArgs += @('-C', $settings.dir) }
     if ($settings.model) { $cpArgs += @('--model', $settings.model) }
     if ($opts.resume) { $cpArgs += @('--resume', $opts.resume) }
-    if ($settings.mode -eq 'trusted') { $cpArgs += '--allow-all-tools' } else { $cpArgs += @('--allow-tool', 'view,glob,rg') }
-    & $cp @cpArgs
+    if ($settings.mode -eq 'trusted') { $cpArgs += '--allow-all-tools' } else { $cpArgs += @('--allow-tool', [string]$settings.allowTools) }
+    foreach ($d in $opts.addDirs) { $cpArgs += @('--add-dir', [string]$d) }
+    foreach ($p in $opts.passthrough) { $cpArgs += [string]$p }
+    & $cp.exe @cpArgs
     exit $LASTEXITCODE
+  }
+  'sessions' {
+    $sub = if ($Args.Count -ge 2) { [string]$Args[1] } else { 'list' }
+    if ($sub -eq 'clear') {
+      if (Test-Path $HistoryPath) { Remove-Item $HistoryPath -Force }
+      Write-Host 'Historial borrado.'
+      exit 0
+    }
+    if ($sub -notin @('list')) { Write-Host 'Uso: ask-cli sessions [list|clear] [n]'; exit 1 }
+    if (-not (Test-Path $HistoryPath)) { Write-Host 'Sin sesiones registradas.'; exit 0 }
+    $n = if ($Args.Count -ge 3) { ConvertTo-IntValue $Args[2] 20 } else { 20 }
+    if ($n -le 0) { $n = 20 }
+    $lines = @(Get-Content $HistoryPath -Tail $n -ErrorAction SilentlyContinue)
+    $rows = @()
+    foreach ($l in $lines) {
+      try { $rows += ($l | ConvertFrom-Json) } catch {}
+    }
+    if ($rows.Count -eq 0) { Write-Host 'Sin sesiones registradas.'; exit 0 }
+    $rows |
+      Select-Object ts, provider, model, code, resume,
+        @{ n = 'prompt'; e = {
+            $p = [string]$_.prompt
+            if ($p.Length -gt 60) { $p.Substring(0, 60) + '...' } else { $p }
+          } } |
+      Format-Table -AutoSize
+    exit 0
   }
   'resume' {
     $opts = Parse-Options @($Args[1..($Args.Count-1)])
@@ -588,9 +785,9 @@ switch ($cmd) {
       Write-Host ("Reanuda Vertex usando: ask-cli run ""<prompt>"" --provider vertex --resume " + $id)
       exit 0
     }
-    $cp = Get-CopilotCmd
-    $cpArgs = @('--resume', $id)
-    & $cp @cpArgs
+    $cp = Get-CopilotInvoker
+    $cpArgs = @() + $cp.prefix + @('--resume', $id)
+    & $cp.exe @cpArgs
     exit $LASTEXITCODE
   }
   'model' {
@@ -612,8 +809,8 @@ switch ($cmd) {
   }
   'auth' {
     $sub = if ($Args.Count -ge 2) { [string]$Args[1] } else { 'status' }
-    $cp = Get-CopilotCmd
-    if ($sub -eq 'login') { & $cp 'login'; exit $LASTEXITCODE }
+    $cp = Get-CopilotInvoker
+    if ($sub -eq 'login') { $la = @() + $cp.prefix + @('login'); & $cp.exe @la; exit $LASTEXITCODE }
     if ($sub -eq 'logout') {
       $gh = Get-Command 'gh' -ErrorAction SilentlyContinue
       if ($gh) {
@@ -632,14 +829,34 @@ switch ($cmd) {
     exit 1
   }
   'doctor' {
-    Write-Host "=== ask-cli doctor ==="
-    try { $cp = Get-CopilotCmd; Write-Host ("copilot: OK (" + $cp + ")") } catch { Write-Host "copilot: FAIL"; exit 1 }
+    Write-Host ("=== ask-cli doctor (v" + $script:AskCliVersion + ") ===")
+    Write-Host ("host: PowerShell " + $PSVersionTable.PSVersion)
+    $pwsh = Get-Command 'pwsh' -ErrorAction SilentlyContinue
+    if ($pwsh) { Write-Host ("pwsh7: OK (" + $pwsh.Path + ")") } else { Write-Host "pwsh7: WARN (no instalado; el arranque es mas lento en PS 5.1)" }
+    try {
+      $sw = [System.Diagnostics.Stopwatch]::StartNew()
+      $cp = Get-CopilotCmd
+      $sw.Stop()
+      Write-Host ("copilot: OK (" + $cp + ") resuelto en " + $sw.ElapsedMilliseconds + " ms")
+      $inv = Get-CopilotInvoker
+      if ($inv.multiline) {
+        Write-Host ("invoker: node directo (" + $inv.exe + ") - prompts multilinea OK")
+      } else {
+        Write-Host "invoker: WARN shim copilot.cmd (cmd.exe trunca en el primer salto de linea; los prompts se aplanan)"
+      }
+    } catch { Write-Host "copilot: FAIL"; exit 1 }
+    $vtimeout = ConvertTo-IntValue $cfg.timeoutSec 180
     try {
       $state = Invoke-RestMethod -Uri 'http://127.0.0.1:8717/api/state' -TimeoutSec 5
       Write-Host ("hanstlers: OK model=" + $state.model)
     } catch { Write-Host "hanstlers: WARN (no responde en :8717)" }
+    Write-Host ("timeoutSec: " + $vtimeout + " (aplica al provider vertex)")
     Write-Host ("config: " + $ConfigPath)
     Write-Host ("history: " + $HistoryPath)
+    if (Test-Path $HistoryPath) {
+      $hi = Get-Item $HistoryPath
+      Write-Host ("history size: " + [math]::Round($hi.Length / 1KB, 1) + " KB (rotacion a " + (ConvertTo-IntValue $cfg.historyMax 2000) + " lineas sobre 2 MB)")
+    }
     exit 0
   }
   'project' {
@@ -683,6 +900,7 @@ switch ($cmd) {
       model = $settings.model
       vertexModel = $settings.vertexModel
       mode = $settings.mode
+      allowTools = $settings.allowTools
       strict = $strictValue
       updatedAt = (Get-Date).ToString('s')
     }
@@ -701,9 +919,11 @@ switch ($cmd) {
       $k = [string]$Args[2]
       $v = [string]$Args[3]
       if (-not ($cfg.ContainsKey($k))) { Write-Host ("Clave inválida: " + $k); exit 1 }
-      $cfg[$k] = $v
+      if ($k -in @('timeoutSec','historyMax')) { $cfg[$k] = ConvertTo-IntValue $v (ConvertTo-IntValue $cfg[$k] 0) }
+      elseif ($k -in @('retry')) { $cfg[$k] = ConvertTo-BoolValue $v $true }
+      else { $cfg[$k] = $v }
       Save-Config $cfg
-      Write-Host ("OK " + $k + "=" + $v)
+      Write-Host ("OK " + $k + "=" + [string]$cfg[$k])
       exit 0
     }
     Write-Host "Uso: ask-cli config show | ask-cli config set <key> <value>"
