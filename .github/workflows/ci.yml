@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, 'perf/**', 'fix/**', 'feat/**']
   pull_request:
   workflow_dispatch:
 
@@ -14,11 +14,13 @@ jobs:
       fail-fast: false
       matrix:
         shell: [pwsh, powershell]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Parse check
-        shell: ${{ matrix.shell }} {0}
         run: |
           $errs = $null
           [System.Management.Automation.Language.Parser]::ParseFile(
@@ -30,14 +32,12 @@ jobs:
           Write-Host 'Sintaxis OK'
 
       - name: Install Pester + PSScriptAnalyzer
-        shell: ${{ matrix.shell }} {0}
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           Install-Module Pester -MinimumVersion 5.5.0 -Scope CurrentUser -Force -SkipPublisherCheck
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
 
       - name: PSScriptAnalyzer
-        shell: ${{ matrix.shell }} {0}
         run: |
           Import-Module PSScriptAnalyzer
           $issues = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
@@ -45,7 +45,6 @@ jobs:
           if ($issues) { exit 1 }
 
       - name: Pester
-        shell: ${{ matrix.shell }} {0}
         run: |
           Import-Module Pester -MinimumVersion 5.5.0
           $cfg = New-PesterConfiguration
