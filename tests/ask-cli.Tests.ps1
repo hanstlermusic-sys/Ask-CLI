@@ -1260,3 +1260,180 @@ Describe 'v0.6.1 - la salida del gate no se envia serializada en CLIXML' {
         $g.output | Should -Match 'MARCADOR_UNICO_XYZ'
     }
 }
+
+Describe 'Get-VertexToolCalls (telemetria del provider vertex)' {
+    BeforeAll {
+        # Formato real que emite HanstlerS dentro del texto del stream.
+        $script:E = [string][char]0x2026   # puntos suspensivos
+        $script:K = [string][char]0x2713   # marca de verificacion
+    }
+
+    It 'no encuentra nada en texto sin herramientas' {
+        $r = Get-VertexToolCalls "Hola, esto es una respuesta normal.`nSin herramientas."
+        @($r.calls).Count | Should -Be 0
+        $r.failed | Should -Be 0
+    }
+
+    It 'tolera texto vacio o nulo' {
+        (Get-VertexToolCalls '').calls.Count | Should -Be 0
+        (Get-VertexToolCalls $null).calls.Count | Should -Be 0
+    }
+
+    It 'extrae una llamada con su argumento' {
+        $r = Get-VertexToolCalls ("read_file(server.js) $E $K 120 lineas " + [char]0x00B7 + " post-check ok")
+        @($r.calls).Count | Should -Be 1
+        $r.calls[0].name | Should -Be 'read_file'
+        $r.calls[0].summary | Should -Be 'server.js'
+        $r.calls[0].success | Should -BeTrue
+        $r.failed | Should -Be 0
+    }
+
+    It 'ignora el icono que precede al nombre' {
+        $icono = [char]::ConvertFromUtf32(0x1F4C2)
+        $r = Get-VertexToolCalls ($icono + " list_dir(src) $E $K 8 entradas")
+        @($r.calls).Count | Should -Be 1
+        $r.calls[0].name | Should -Be 'list_dir'
+    }
+
+    It 'cuenta como fallo un post-check fallido' {
+        $r = Get-VertexToolCalls ("write_file(a.txt) $E $K post-check fall" + [char]0x00F3)
+        $r.failed | Should -Be 1
+        $r.calls[0].success | Should -BeFalse
+    }
+
+    It 'cuenta como fallo un rollback automatico' {
+        $r = Get-VertexToolCalls ("apply_patch(x.js) $E $K rollback autom" + [char]0x00E1 + "tico")
+        $r.failed | Should -Be 1
+        $r.calls[0].success | Should -BeFalse
+    }
+
+    It 'una llamada sin marca de exito no cuenta como fallo pero tampoco como escritura' {
+        # La corrida se corto a mitad: no hay veredicto, no se inventa ninguno.
+        $r = Get-VertexToolCalls "write_file(a.txt) $E"
+        @($r.calls).Count | Should -Be 1
+        $r.failed | Should -Be 0
+        $r.calls[0].success | Should -BeFalse
+        @($r.filesModified).Count | Should -Be 0
+    }
+
+    It 'registra los archivos tocados solo de herramientas de archivo' {
+        $t = "write_file(a.txt) $E $K post-check ok`nrun_command(npm test) $E $K exit 0`ndelete_file(b.txt) $E $K post-check ok"
+        $r = Get-VertexToolCalls $t
+        @($r.calls).Count | Should -Be 3
+        # run_command muta, pero su argumento es un comando, no una ruta.
+        (@($r.filesModified) -join ',') | Should -Be 'a.txt,b.txt'
+    }
+
+    It 'no duplica el mismo archivo' {
+        $t = "write_file(a.txt) $E $K post-check ok`nwrite_file(a.txt) $E $K post-check ok"
+        @((Get-VertexToolCalls $t).filesModified).Count | Should -Be 1
+    }
+
+    It 'conserva argumentos que llevan parentesis' {
+        $r = Get-VertexToolCalls "run_command(node -e (1+2)) $E $K exit 0"
+        $r.calls[0].name | Should -Be 'run_command'
+        $r.calls[0].summary | Should -Be 'node -e (1+2)'
+    }
+
+    It 'alimenta la deteccion de bucle igual que la ruta de Copilot' {
+        $linea = "search_in_files(TODO) $E $K 0 resultados"
+        $r = Get-VertexToolCalls (($linea, $linea, $linea) -join "`n")
+        $loop = Get-ToolLoop $r.calls 3
+        $loop.found | Should -BeTrue
+        $loop.name | Should -Be 'search_in_files'
+        $loop.count | Should -Be 3
+    }
+
+    It 'alimenta Test-HasWriteTool' {
+        $r = Get-VertexToolCalls "write_file(a.txt) $E $K post-check ok"
+        Test-HasWriteTool $r.calls | Should -BeTrue
+    }
+}
+
+Describe 'Verificacion de la ruta vertex' {
+    It 'la rama vertex ya no declara verified sin comprobar' {
+        # Regresion: antes se hacia "$res.verified = $true" a ciegas justo tras
+        # normalizar el envelope, y se salia antes de todos los gates.
+        $src = Get-Content $script:ScriptPath -Raw
+        $src | Should -Not -Match 'Vertex no expone telemetria de herramientas'
+        $src | Should -Match 'Get-VertexToolCalls \(\[string\]\$res\.text\)'
+    }
+
+    It 'detecta que la respuesta afirma escribir sin evidencia' {
+        $res = @{
+            text = 'Ya cre' + [char]0x00E9 + ' el archivo config.json con la configuracion.'
+            toolCalls = (Get-VertexToolCalls '').calls
+            toolFailed = 0
+            filesModified = @()
+        }
+        $v = Test-ResponseVerification $res 'crea config.json' 3
+        $v.ok | Should -BeFalse
+        ($v.issues -join ' ') | Should -Match 'afirma haber creado'
+    }
+
+    It 'acepta una corrida con evidencia real de escritura' {
+        $E = [string][char]0x2026; $K = [string][char]0x2713
+        $vt = Get-VertexToolCalls "write_file(config.json) $E $K post-check ok"
+        $res = @{
+            text = 'Ya cre' + [char]0x00E9 + ' el archivo config.json.'
+            toolCalls = $vt.calls
+            toolFailed = $vt.failed
+            filesModified = $vt.filesModified
+        }
+        $v = Test-ResponseVerification $res 'crea config.json' 3
+        $v.ok | Should -BeTrue
+    }
+}
+
+Describe 'Resolve-Settings propaga la configuracion de HanstlerS' {
+    # Resolve-Settings lee muchas claves de $cfg, asi que el fixture parte de
+    # la config por defecto y solo sobrescribe la clave bajo prueba.
+    # En Pester 5+ el cuerpo del Describe corre en descubrimiento: la funcion
+    # debe definirse en BeforeAll para existir dentro de los It.
+    BeforeAll {
+        function New-Cfg([hashtable]$overrides) {
+            $c = Default-Config
+            foreach ($k in $overrides.Keys) { $c[$k] = $overrides[$k] }
+            return $c
+        }
+    }
+    # Regresion: ninguna de las dos claves se copiaba a $settings, de modo que
+    # Get-HanstlersUrl siempre devolvia 127.0.0.1:8717 y la deteccion de bucle
+    # siempre usaba umbral 3, sin importar lo que dijera config.json.
+    It 'lleva hanstlersUrl de la config a los settings' {
+        $s = Resolve-Settings (New-Cfg @{ hanstlersUrl = 'http://10.0.0.5:9000' }) (Parse-Options @('x'))
+        $s.hanstlersUrl | Should -Be 'http://10.0.0.5:9000'
+    }
+
+    It 'Get-HanstlersUrl respeta el valor configurado' {
+        $s = Resolve-Settings (New-Cfg @{ hanstlersUrl = 'http://10.0.0.5:9000/' }) (Parse-Options @('x'))
+        Get-HanstlersUrl $s | Should -Be 'http://10.0.0.5:9000'
+    }
+
+    It 'cae al puerto por defecto cuando no hay nada configurado' {
+        $s = Resolve-Settings (Default-Config) (Parse-Options @('x'))
+        Get-HanstlersUrl $s | Should -Be 'http://127.0.0.1:8717'
+    }
+
+    It 'lleva loopThreshold de la config a los settings' {
+        $s = Resolve-Settings (New-Cfg @{ loopThreshold = 5 }) (Parse-Options @('x'))
+        $s.loopThreshold | Should -Be 5
+    }
+
+    It 'usa 3 como umbral cuando la config no lo define' {
+        $s = Resolve-Settings (Default-Config) (Parse-Options @('x'))
+        $s.loopThreshold | Should -Be 3
+    }
+
+    It 'rechaza un umbral menor que 2 y vuelve al valor por defecto' {
+        # Con umbral 1 cualquier llamada aislada seria un "bucle".
+        $s = Resolve-Settings (New-Cfg @{ loopThreshold = 1 }) (Parse-Options @('x'))
+        $s.loopThreshold | Should -Be 3
+    }
+
+    It 'no lanza cuando los opts no traen esas claves' {
+        # Bajo Set-StrictMode acceder a $opts.clave inexistente lanza, incluso
+        # sobre una hashtable: por eso el acceso va via Get-Prop.
+        { Resolve-Settings (Default-Config) (Parse-Options @('x')) } | Should -Not -Throw
+    }
+}

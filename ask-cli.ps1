@@ -41,6 +41,25 @@ $script:WriteToolRegex = [regex]::new(
   '^(?:write|edit|create|replace|insert|str_replace|apply_patch|multi_edit|notebook_edit|save|delete|remove|move|rename|mkdir|bash|sh|shell|powershell|pwsh|cmd|terminal|run_command|execute_command)(?:[_-]\w+)*$',
   $RxCompiledIC)
 
+# Evidencia de ejecucion del backend HanstlerS (provider vertex). No emite
+# telemetria estructurada: anuncia cada herramienta dentro del propio texto como
+#   "<icono> nombre(argumento) ..."
+# y al terminar concatena " (check) <resumen>" en la MISMA linea. El resumen lleva
+# el veredicto del post-check del servidor, que es lo que permite saber si fallo.
+# Los caracteres se componen con [char] a proposito: mantiene el fuente en ASCII.
+$script:VertexToolRegex = [regex]::new(
+  '^(?:\S+\s+)?([a-z_][a-z0-9_]+)\((.*)\)\s*' + [char]0x2026 + '(.*)$',
+  $RxCompiled)
+# "post-check fallo" y "rollback automatico" se matchean por prefijo sin acento.
+$script:VertexToolFailRegex = [regex]::new(
+  'post-check\s+fall|rollback\s+autom|fall\S*\s+rollback',
+  $RxCompiledIC)
+# Solo estas herramientas de HanstlerS tocan archivos concretos: su argumento es
+# una ruta. run_command tambien muta, pero su argumento es un comando, no un path.
+$script:VertexFileToolRegex = [regex]::new(
+  '^(?:write_file|apply_patch|delete_file|move_file)$',
+  $RxCompiledIC)
+
 # Ruido de PowerShell/Node que nunca aporta nada al usuario: se descarta siempre.
 # Nota: PowerShell emite CategoryInfo/FullyQualifiedErrorId con prefijo "    + ", de ahi el \+? opcional.
 $script:NoiseRegex = [regex]::new(
@@ -274,6 +293,12 @@ function Resolve-Settings($cfg, [hashtable]$opts) {
   $out.noAskUser = if ($null -ne $opts.noAskUser) { ConvertTo-BoolValue $opts.noAskUser $false } else { ConvertTo-BoolValue (Get-Prop $cfg 'noAskUser') $false }
   $out.maxContinues = if ((ConvertTo-IntValue $opts.maxContinues 0) -gt 0) { ConvertTo-IntValue $opts.maxContinues 0 } else { ConvertTo-IntValue (Get-Prop $cfg 'maxContinues') 0 }
   $out.qualityGate = if ($null -ne $opts.qualityGate) { ConvertTo-BoolValue $opts.qualityGate $false } else { ConvertTo-BoolValue (Get-Prop $cfg 'qualityGate') $false }
+  # Sin estas dos, Get-HanstlersUrl y Get-ToolLoop caian siempre al valor por
+  # defecto y las claves de config.json no tenian ningun efecto.
+  $out.hanstlersUrl = if (Get-Prop $opts 'hanstlersUrl') { [string](Get-Prop $opts 'hanstlersUrl') } elseif ($prof -and (Get-Prop $prof 'hanstlersUrl')) { [string](Get-Prop $prof 'hanstlersUrl') } else { [string](Get-Prop $cfg 'hanstlersUrl') }
+  $out.loopThreshold = if ((ConvertTo-IntValue (Get-Prop $opts 'loopThreshold') 0) -gt 0) { ConvertTo-IntValue (Get-Prop $opts 'loopThreshold') 3 } else { ConvertTo-IntValue (Get-Prop $cfg 'loopThreshold') 3 }
+  if ($out.loopThreshold -lt 2) { $out.loopThreshold = 3 }
+
   $out.verifyCommand = if ($opts.verifyCommand) { [string]$opts.verifyCommand } elseif ($prof -and (Get-Prop $prof 'verifyCommand')) { [string](Get-Prop $prof 'verifyCommand') } else { [string](Get-Prop $cfg 'verifyCommand') }
 
   return $out
@@ -522,6 +547,41 @@ function Test-HasWriteTool($toolCalls) {
     if ($script:WriteToolRegex.IsMatch([string]$t.name)) { return $true }
   }
   return $false
+}
+
+# Reconstruye las llamadas a herramientas a partir del texto del stream de
+# HanstlerS, para que la ruta vertex pueda pasar por los mismos gates que la de
+# Copilot en vez de declararse verificada a ciegas.
+function Get-VertexToolCalls([string]$text) {
+  $calls = New-Object System.Collections.Generic.List[object]
+  $files = New-Object System.Collections.Generic.List[string]
+  $failed = 0
+  # Se devuelven ARRAYS, no List[object]: bajo Set-StrictMode estricto de
+  # PowerShell 5.1 la expresion @($lista).Count lanza "Argument types do not
+  # match", y ese es justo el patron que usan los gates para contar llamadas.
+  if ([string]::IsNullOrWhiteSpace($text)) {
+    return @{ calls = @(); failed = 0; filesModified = @() }
+  }
+  $check = [string][char]0x2713
+  foreach ($line in ($text -split "`r?`n")) {
+    $m = $script:VertexToolRegex.Match($line)
+    if (-not $m.Success) { continue }
+    $name = $m.Groups[1].Value
+    $arg = $m.Groups[2].Value.Trim()
+    $tail = $m.Groups[3].Value
+    # Sin la marca de exito la llamada quedo a medias (la corrida se corto):
+    # no se cuenta como fallo, pero tampoco como escritura confirmada.
+    $done = $tail.Contains($check)
+    $ok = $done -and (-not $script:VertexToolFailRegex.IsMatch($tail))
+    if ($done -and -not $ok) { $failed++ }
+    # Misma forma que la ruta de Copilot (id/name/summary/success): el resto
+    # del script lee esos campos y con StrictMode un campo ausente lanza.
+    $calls.Add(@{ id = ''; name = $name; summary = $arg; success = $ok })
+    if ($ok -and $arg -and $script:VertexFileToolRegex.IsMatch($name) -and -not $files.Contains($arg)) {
+      $files.Add($arg)
+    }
+  }
+  return @{ calls = $calls.ToArray(); failed = $failed; filesModified = $files.ToArray() }
 }
 
 # Verificacion determinista: no juzga el estilo de la prosa, sino la evidencia
@@ -1077,14 +1137,57 @@ function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opt
       $res = Invoke-VertexPrompt ($effective + "`n`nREINTENTO OBLIGATORIO: ejecuta la tarea ahora, no pidas más datos intermedios.") $settings $opts $cfg
     }
     if ($res.resume) { $cfg.lastVertexConvId = $res.resume }
-    # Vertex no expone telemetria de herramientas: normalizamos al mismo envelope.
-    $res.toolCalls = New-Object System.Collections.Generic.List[object]
-    $res.toolFailed = 0
-    $res.filesModified = @()
+
+    # HanstlerS no expone telemetria estructurada, pero SI ejecuta herramientas
+    # por esta ruta (reenruta a su agente cuando la tarea es de ejecucion). La
+    # evidencia viaja incrustada en el texto, asi que se reconstruye desde ahi.
+    # Antes se devolvia verified=$true sin comprobar nada: el envelope afirmaba
+    # que la corrida estaba verificada cuando ningun gate la habia mirado.
+    $vt = Get-VertexToolCalls ([string]$res.text)
+    $res.toolCalls = $vt.calls
+    $res.toolFailed = $vt.failed
+    $res.filesModified = $vt.filesModified
     $res.usage = @{ premiumRequests = 0; apiMs = 0; sessionMs = 0; linesAdded = 0; linesRemoved = 0 }
-    $res.verified = $true
-    $res.issues = @()
     Set-Prop $res 'quality' $null
+
+    $wantVerify = (ConvertTo-BoolValue $opts.verify $true) -and (ConvertTo-BoolValue $cfg.verify $true)
+    $wantRetry = (ConvertTo-BoolValue $opts.retry $true) -and (ConvertTo-BoolValue $cfg.retry $true)
+    $loopThreshold = ConvertTo-IntValue (Get-Prop $settings 'loopThreshold') 3
+    $verification = @{ ok = $true; issues = @(); actionable = $false; loop = @{ found = $false } }
+
+    if ($wantVerify -and $res.code -eq 0) {
+      $verification = Test-ResponseVerification $res $prompt $loopThreshold
+      if ((-not $verification.ok) -and $wantRetry -and $res.resume) {
+        if (-not $opts.quiet) {
+          Write-Notice '[ask-cli] verificacion fallida, reintentando con evidencia:' $settings
+          foreach ($i in $verification.issues) { Write-Notice ('  - ' + $i) $settings }
+        }
+        # El reintento reusa el convId: HanstlerS conserva el transcript del
+        # agente por conversacion, asi que el reintento continua el trabajo en
+        # vez de empezar de cero.
+        $retryOpts = @{}
+        foreach ($k in $opts.Keys) { $retryOpts[$k] = $opts[$k] }
+        $retryOpts.resume = $res.resume
+        $retryRes = Invoke-VertexPrompt (Build-VerificationFeedback $verification $res) $settings $retryOpts $cfg
+        if ($retryRes.code -eq 0) {
+          $rt = Get-VertexToolCalls ([string]$retryRes.text)
+          # Las llamadas del turno anterior se conservan como evidencia pero se
+          # marcan 'prior': la deteccion de bucle solo juzga el turno nuevo.
+          $merged = @($rt.calls)
+          foreach ($t in $res.toolCalls) { Set-Prop $t 'prior' $true; $merged += $t }
+          $retryRes.toolCalls = $merged
+          $retryRes.toolFailed = $rt.failed + $res.toolFailed
+          $retryRes.filesModified = if (@($rt.filesModified).Count -eq 0) { $res.filesModified } else { $rt.filesModified }
+          $retryRes.usage = $res.usage
+          Set-Prop $retryRes 'quality' $null
+          $res = $retryRes
+          $verification = Test-ResponseVerification $res $prompt $loopThreshold
+        }
+      }
+    }
+
+    $res.verified = [bool]$verification.ok
+    $res.issues = @($verification.issues)
     return $res
   }
 
