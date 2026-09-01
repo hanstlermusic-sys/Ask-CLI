@@ -203,6 +203,29 @@ Rendirse con un diagnóstico es más útil que insistir.
 Solo se juzga el turno más reciente: si el agente cayó en un bucle y el reintento lo
 sacó, no se le sigue penalizando por ello.
 
+## Verificación del provider `vertex`
+
+Los gates no son exclusivos de Copilot: la ruta `--provider vertex` (backend HanstlerS)
+pasa por los mismos. Antes se devolvía `verified: true` sin comprobar nada, así que
+cualquier alucinación del modelo ("ya creé el archivo") pasaba como buena.
+
+HanstlerS no emite telemetría estructurada, pero sí ejecuta herramientas por esta ruta.
+La evidencia viaja incrustada en el texto del stream, con la forma:
+
+```
+write_file(config.json) … ✓ 1 KB · post-check ok
+```
+
+`ask-cli` la reconstruye desde ahí — nombre, argumento y veredicto del post-check del
+servidor — y la alimenta a los gates que ya existían. El envelope JSON pasa a incluir
+`tools` y `filesModified` reales, y `verified` refleja el resultado de la verificación.
+Si falla, reintenta reusando el `convId`, de modo que el reintento continúa el trabajo
+en vez de empezar de cero.
+
+**Limitación:** depende del formato del stream de HanstlerS. Si ese formato cambia, el
+parser deja de ver la evidencia y las corridas buenas empezarán a marcarse como no
+verificadas. La solución de fondo es que HanstlerS emita un evento SSE estructurado.
+
 ## Modo dev autónomo
 
 `--dev` es el atajo recomendado para "hazlo tú". Combina autonomía de ejecución con una red de
@@ -315,6 +338,8 @@ Archivos en `~/.ask-cli/`:
 | `noAskUser` | `false` | Prohíbe al agente hacer preguntas. |
 | `qualityGate` | `false` | Ejecuta la suite del proyecto tras tocar código. |
 | `verifyCommand` | `` | Comando de verificación explícito (omite la detección). |
+| `hanstlersUrl` | `http://127.0.0.1:8717` | URL del backend HanstlerS (provider `vertex`). |
+| `loopThreshold` | `3` | Llamadas idénticas consecutivas que se consideran un bucle. |
 
 ### Códigos de salida
 
@@ -391,6 +416,15 @@ la salida de `--json` (`ConvertFrom-Json` fallaba con *Invalid JSON primitive*).
 **Colisión con la variable automática `$profile`.** `Resolve-Settings` usaba `$profile`, que en PowerShell es
 una variable automática con la ruta del perfil. Funcionaba por sombreado local, pero era frágil bajo
 `Set-StrictMode`; se renombró a `$prof`.
+
+### Correcciones de v0.7.0
+
+- `Resolve-Settings` no copiaba `hanstlersUrl` ni `loopThreshold` a los settings, así que
+  **ambas claves de `config.json` eran inertes**: el provider `vertex` apuntaba siempre a
+  `127.0.0.1:8717` (imposible usar otro host o puerto) y la detección de bucles usaba
+  siempre el umbral 3, ignorando la configuración.
+- Bajo `Set-StrictMode`, `@($lista)` sobre un `List[object]` lanza *"Argument types do not
+  match"*. Se devuelven arrays con `.ToArray()`.
 
 ### Limitaciones conocidas
 
