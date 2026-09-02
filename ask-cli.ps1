@@ -15,6 +15,7 @@ $ProfilesPath = Join-Path $AskHome 'project-profiles.json'
 $script:AskCliVersion = '0.7.0'
 $script:ResolvedCopilot = ''
 $script:Invoker = $null
+$script:SupportsUsageOutputFlag = $null
 $script:Cfg = $null
 
 # Marcador idempotente del bloque que ask-cli inyecta en AGENTS.md.
@@ -392,6 +393,18 @@ function Get-CopilotInvoker {
   } catch {}
   $script:Invoker = $inv
   return $inv
+}
+
+function Test-CopilotUsageOutputFlag {
+  if ($null -ne $script:SupportsUsageOutputFlag) { return [bool]$script:SupportsUsageOutputFlag }
+  try {
+    $inv = Get-CopilotInvoker
+    $help = (& $inv.exe @($inv.prefix + @('--help')) 2>&1 | Out-String)
+    $script:SupportsUsageOutputFlag = ($help -match '(?im)--usage-output-file\b')
+  } catch {
+    $script:SupportsUsageOutputFlag = $false
+  }
+  return [bool]$script:SupportsUsageOutputFlag
 }
 
 # Fallback para el shim .cmd: aplana el prompt para que cmd.exe no lo trunque.
@@ -892,8 +905,11 @@ function Invoke-CopilotPrompt([string]$prompt, [hashtable]$settings, [hashtable]
   $maxCredits = ConvertTo-IntValue $settings.maxCredits 0
   if ($maxCredits -gt 0) { $cargs += @('--max-ai-credits', [string]$maxCredits) }
 
-  $usageFile = Join-Path ([System.IO.Path]::GetTempPath()) ("askcli-usage-" + [Guid]::NewGuid().ToString() + ".json")
-  $cargs += @('--usage-output-file', $usageFile)
+  $usageFile = ''
+  if (Test-CopilotUsageOutputFlag) {
+    $usageFile = Join-Path ([System.IO.Path]::GetTempPath()) ("askcli-usage-" + [Guid]::NewGuid().ToString() + ".json")
+    $cargs += @('--usage-output-file', $usageFile)
+  }
   # Siempre pedimos JSONL: es la unica forma de saber que se ejecuto de verdad.
   $cargs += @('--no-color', '--output-format', 'json')
   foreach ($p in $opts.passthrough) { $cargs += [string]$p }
@@ -983,7 +999,7 @@ function Invoke-CopilotPrompt([string]$prompt, [hashtable]$settings, [hashtable]
   if ($stream -and $textSb.Length -gt 0) { Write-Host '' }
 
   try {
-    if (Test-Path $usageFile) {
+    if ($usageFile -and (Test-Path $usageFile)) {
       $usageObj = (Get-Content $usageFile -Raw) | ConvertFrom-Json
       $meta.model = [string](Get-Prop $usageObj 'currentModel')
       Remove-Item $usageFile -Force -ErrorAction SilentlyContinue
@@ -1804,6 +1820,12 @@ switch ($cmd) {
         Write-Host ("invoker: node directo (" + $inv.exe + ") - prompts multilinea OK")
       } else {
         Write-Host "invoker: WARN shim copilot.cmd (cmd.exe trunca en el primer salto de linea; los prompts se aplanan)"
+      }
+      $hasUsageFlag = Test-CopilotUsageOutputFlag
+      if ($hasUsageFlag) {
+        Write-Host "copilot flag --usage-output-file: OK"
+      } else {
+        Write-Host "copilot flag --usage-output-file: WARN no soportado; ask-cli entra en modo compatible"
       }
     } catch { Write-Host "copilot: FAIL"; exit 1 }
     $vtimeout = ConvertTo-IntValue $cfg.timeoutSec 180
